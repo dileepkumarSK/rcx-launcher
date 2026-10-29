@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RCX Env Launcher</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">RCX</span>
+      <span class="title">Env Launcher</span>
+    </div>
+    <input id="filter" type="search" placeholder="Filter clients, envs, links…  (/ to focus)" autocomplete="off">
+    <div class="actions">
+      <div id="status" class="status" title="Active VPNs"></div>
+      <button id="sync" class="btn-ghost" title="Pull the latest links from the wiki and reload">Fetch latest</button>
+    </div>
+  </header>
+
+  <nav id="nav" class="clientnav"></nav>
+
+  <main id="main" class="main">
+    <div id="loading" class="empty">Loading…</div>
+  </main>
+
+  <div id="toasts" class="toasts"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

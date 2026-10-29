@@ -1,0 +1,15 @@
+# --- Secrets: NEVER commit (per-user credentials) ---
+jenkins.json
+github.json
+
+# --- Per-user / generated data (regenerated locally; holds internal URLs,
+#     job names, personal favourites — not meant to be shared) ---
+config.json
+settings.json
+favorites.json
+.jenkins_jobs_cache.json
+
+# --- Python / runtime cruft ---
+__pycache__/
+*.pyc
+*.log

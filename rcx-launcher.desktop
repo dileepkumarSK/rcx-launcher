@@ -1,0 +1,11 @@
+[Desktop Entry]
+# Reference template only. Run ./install-desktop.sh to generate and install a
+# copy with the Exec/Icon paths set to wherever this repo actually lives.
+Type=Application
+Name=RCX Env Launcher
+Comment=Open client/env Kibana, UI & NiFi links, auto-connecting the right VPN
+Exec=/home/dkumar/rcx-launcher/start.sh
+Icon=/home/dkumar/rcx-launcher/web/icon.svg
+Terminal=false
+Categories=Development;
+StartupWMClass=RCX-Launcher
