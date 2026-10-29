@@ -88,7 +88,8 @@ bookmarkable by hash:
   Click the **★ star** on any repo to favorite it — favorites collect in a **★ Favorites**
   bucket at the top and are saved in `favorites.json`.
 - **🔧 Jenkins** (`#@jenkins`) — troubleshoot a build; see below.
-- **⚙ Settings** (`#@settings`) — your GitHub + Jenkins logins and the data sources.
+- **⚙ Settings** (`#@settings`) — your GitHub + Jenkins logins, which **browser** opens
+  the links (Chrome by default, or your system default), and the data sources.
 
 Environments with no matching VPN are intentionally omitted.
 
@@ -176,7 +177,10 @@ Then re-run `sync_wiki.py`.
 
 - Nothing is exposed off `127.0.0.1`; there's no auth because it's single-user/local.
 - Link pages open in your **default Chrome profile** (where you're already logged in);
-  the launcher window itself uses a separate profile so it stays its own app.
+  the launcher window itself uses a separate profile so it stays its own app. You can
+  switch link-opening to your **system default browser** in **⚙ Settings → Browser**
+  (uses `xdg-open`); Chrome mode also falls back to the system default if no
+  Chrome/Chromium is installed.
 - VPNs are brought **up** on demand; other VPNs are left connected (no auto-disconnect).
   If an `nmcli` connection needs a password it isn't storing, NetworkManager will prompt;
   if it can't connect non-interactively the button reports the `nmcli` error.

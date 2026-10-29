@@ -765,7 +765,44 @@ async function renderSettingsView() {
   body.innerHTML = "";
   body.append(buildGithubSection(data));
   body.append(buildJenkinsSection(data));
+  body.append(buildBrowserSection(data));
   body.append(buildSourcesSection(data));
+}
+
+function buildBrowserSection(data) {
+  const s = (data.settings || {});
+  const current = s.browser === "default" ? "default" : "chrome";
+  const sec = setSection("Browser",
+    "Which browser opens the Kibana / UI / NiFi links when you click them.");
+
+  const form = el("div", "set-form");
+  const choices = [
+    ["chrome", "Google Chrome / Chromium",
+      "Opens in your logged-in Chrome profile (recommended — you stay signed in to Kibana/NiFi)."],
+    ["default", "System default browser",
+      "Opens in whatever browser your system is set to (Firefox, Edge, etc.) via xdg-open."],
+  ];
+  for (const [val, title, desc] of choices) {
+    const row = el("label", "set-radio");
+    const radio = el("input"); radio.type = "radio"; radio.name = "browserpref"; radio.value = val;
+    if (val === current) radio.checked = true;
+    radio.addEventListener("change", async () => {
+      try {
+        const r = await api("/api/settings", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ browser: val }),
+        });
+        if (r.ok) toast("Links now open in " + (val === "default" ? "your system default browser" : "Chrome"), "ok");
+        else toast("Save failed", "err", r.error || "");
+      } catch (e) { toast("Save failed", "err", String(e)); }
+    });
+    const txt = el("div", "set-radio-txt");
+    txt.append(el("div", "set-radio-title", title), el("div", "set-radio-desc", desc));
+    row.append(radio, txt);
+    form.append(row);
+  }
+  sec.append(form);
+  return sec;
 }
 
 function setSection(title, subtitle) {

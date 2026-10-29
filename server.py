@@ -38,6 +38,7 @@ DEFAULT_SETTINGS = {
     "github_org": "reactorcx",
     "wiki_url": "https://github.com/reactorcx/rcx-devops.wiki.git",
     "jenkins_host_suffix": "devops.lmvi.net",  # only fetch builds from this domain
+    "browser": "chrome",  # "chrome" = logged-in Chrome/Chromium; "default" = system default (xdg-open)
 }
 
 
@@ -56,6 +57,8 @@ def save_settings(data):
     for k in ("github_org", "wiki_url", "jenkins_host_suffix"):
         if data.get(k):
             cfg[k] = str(data[k]).strip()
+    if data.get("browser") in ("chrome", "default"):
+        cfg["browser"] = data["browser"]
     with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     return cfg
@@ -495,16 +498,33 @@ def vpn_down(name):
     return (r.returncode == 0), (r.stderr or r.stdout or "").strip()
 
 
-def open_in_chrome(url):
-    if not CHROME:
-        return False, "Chrome not found on this machine"
+def _spawn(argv):
     try:
-        subprocess.Popen([CHROME, url],
+        subprocess.Popen(argv,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
+    except FileNotFoundError:
+        return False, f"{argv[0]} not found on this machine"
     except Exception as exc:
         return False, str(exc)
     return True, "opened"
+
+
+def open_url(url):
+    """Open a URL in the configured browser. 'chrome' (default) uses the detected
+    Chrome/Chromium so pages land in your already-logged-in profile; 'default'
+    uses the system default browser via xdg-open. Chrome mode falls back to the
+    system default if no Chrome/Chromium is installed."""
+    pref = load_settings().get("browser", "chrome")
+    if pref == "default":
+        if not shutil.which("xdg-open"):
+            return False, "system default browser unavailable (xdg-open missing)"
+        return _spawn(["xdg-open", url])
+    if CHROME:
+        return _spawn([CHROME, url])
+    if shutil.which("xdg-open"):          # Chrome not installed → use system default
+        return _spawn(["xdg-open", url])
+    return False, "Chrome not found on this machine"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -784,7 +804,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "vpnConnected": False,
                                      "error": f"VPN '{vpn}': {vpn_msg}"}, 502)
                     return
-            ok, msg = open_in_chrome(url)
+            ok, msg = open_url(url)
         self._send_json({"ok": ok, "vpnConnected": vpn_connected,
                          "vpnMessage": vpn_msg, "error": None if ok else msg})
 
