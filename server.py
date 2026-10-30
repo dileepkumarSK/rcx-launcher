@@ -8,6 +8,7 @@ Run:  python3 server.py [--port 8766]
 """
 
 import base64
+import http.cookiejar
 import json
 import os
 import re
@@ -164,10 +165,14 @@ def save_jenkins(data):
     return cfg
 
 
-def _jenkins_request(cfg, full_url, method="GET", data=None, headers=None):
+def _jenkins_request(cfg, full_url, method="GET", data=None, headers=None, cookiejar=None):
     """Make an authenticated Jenkins request. Returns (status, headers, body_bytes).
     Verifies TLS, falling back to unverified only on a cert error (internal host
-    over VPN). Only hosts under the configured suffix are ever contacted."""
+    over VPN). Only hosts under the configured suffix are ever contacted.
+
+    Pass a shared `cookiejar` across a crumb GET + a build POST so Jenkins sees them
+    as one session — its CSRF crumb is tied to the session cookie, so a POST without
+    it is rejected with 403 even when the token is valid."""
     host = urlparse(full_url).hostname or ""
     suffix = load_settings()["jenkins_host_suffix"]
     if not host.endswith(suffix):
@@ -180,8 +185,12 @@ def _jenkins_request(cfg, full_url, method="GET", data=None, headers=None):
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         ctx = ssl._create_unverified_context() if unverified else None
+        handlers = [urllib.request.HTTPSHandler(context=ctx)]
+        if cookiejar is not None:
+            handlers.append(urllib.request.HTTPCookieProcessor(cookiejar))
+        opener = urllib.request.build_opener(*handlers)
         try:
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            with opener.open(req, timeout=30) as r:
                 return r.status, dict(r.headers), r.read()
         except ssl.SSLError as exc:
             last = exc
@@ -350,10 +359,12 @@ def jenkins_diagnose(cfg, build_url):
     }
 
 
-def jenkins_crumb(cfg):
-    """CSRF crumb header for POSTs, or {} if the issuer is disabled/unreachable."""
+def jenkins_crumb(cfg, cookiejar=None):
+    """CSRF crumb header for POSTs, or {} if the issuer is disabled/unreachable.
+    Share `cookiejar` with the following POST so the crumb's session cookie rides along."""
     try:
-        _, _, body = _jenkins_request(cfg, cfg["base"].rstrip("/") + "/crumbIssuer/api/json")
+        _, _, body = _jenkins_request(
+            cfg, cfg["base"].rstrip("/") + "/crumbIssuer/api/json", cookiejar=cookiejar)
         d = json.loads(body.decode("utf-8", "replace"))
         return {d["crumbRequestField"]: d["crumb"]}
     except Exception:
@@ -384,7 +395,10 @@ def jenkins_trigger(cfg, job_url):
     buildable, params = jenkins_job_params(cfg, job_url)
     if not buildable:
         raise ValueError("this job can't be built directly — pick a branch, not the repo")
-    headers = jenkins_crumb(cfg)
+    # One cookie session for the crumb GET + the build POST (Jenkins ties the
+    # CSRF crumb to the session cookie; a POST without it gets 403).
+    jar = http.cookiejar.CookieJar()
+    headers = jenkins_crumb(cfg, cookiejar=jar)
     base = job_url.rstrip("/")
     if params:
         data = urlencode(params).encode()
@@ -392,7 +406,8 @@ def jenkins_trigger(cfg, job_url):
     else:
         data = b""
         url = base + "/build"
-    _, resp_headers, _ = _jenkins_request(cfg, url, method="POST", data=data, headers=headers)
+    _, resp_headers, _ = _jenkins_request(
+        cfg, url, method="POST", data=data, headers=headers, cookiejar=jar)
     loc = (resp_headers.get("Location") or "").rstrip("/")
     return {"queue": loc, "parameterized": bool(params)}
 
@@ -741,12 +756,34 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, 400)
             return
         except urllib.error.HTTPError as exc:
-            self._send_json({"ok": False, "error": self._jenkins_http_msg(exc.code)}, 502)
+            self._send_json({"ok": False, "error": self._jenkins_trigger_error(exc)}, 502)
             return
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 502)
             return
         self._send_json({"ok": True, **res})
+
+    @staticmethod
+    def _jenkins_trigger_error(exc):
+        """Explain a failed build POST — tell a CSRF-crumb 403 from a real permission one."""
+        body = reason = ""
+        try:
+            body = (exc.read() or b"").decode("utf-8", "replace")
+        except Exception:
+            pass
+        try:
+            reason = exc.headers.get("X-Error") or ""
+        except Exception:
+            pass
+        blob = (reason + " " + body).lower()
+        if exc.code == 403 and "crumb" in blob:
+            return ("Jenkins rejected the CSRF crumb. Generate an API token at "
+                    "/me/configure and use it (not your password) in Settings → Jenkins.")
+        if exc.code == 403:
+            return ("access denied — your Jenkins user can't start this build "
+                    "(needs Job/Build permission)" + (f": {reason}" if reason else ""))
+        msg = Handler._jenkins_http_msg(exc.code)
+        return msg + (f" ({reason})" if reason else "")
 
     def _handle_jenkins_build_status(self):
         cfg = load_jenkins()

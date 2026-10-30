@@ -607,20 +607,27 @@ def main():
     else:
         print("WARNING: Common-Access-Sheet.md not found")
 
-    # Build output, sorted. Environments without a VPN are dropped (per request).
+    # Build output, sorted. Environments without a matching VPN can't be launched,
+    # so they're kept out of the launchable list -- but recorded under "hidden" so
+    # the UI can show "N hidden (no VPN matched)" instead of them vanishing silently.
     out_clients = []
     dropped = 0
     for client in sorted(clients, key=str.upper):
         envs = clients[client]
         env_list = []
+        hidden = []
         for env_name in sorted(envs, key=lambda e: (TIER_RANK.get(envs[e]["tier"], 1), e.lower())):
             e = envs[env_name]
             if not e["vpn"]:
                 dropped += 1
+                hidden.append({"name": env_name, "tier": e["tier"], "reason": "no VPN matched"})
                 continue
             env_list.append({"name": env_name, "vpn": e["vpn"], "links": e["links"]})
         if env_list:
-            out_clients.append({"name": client, "environments": env_list})
+            co = {"name": client, "environments": env_list}
+            if hidden:
+                co["hidden"] = hidden
+            out_clients.append(co)
 
     repos = fetch_repos()
     if repos is None:  # fetch failed — preserve whatever the last config had

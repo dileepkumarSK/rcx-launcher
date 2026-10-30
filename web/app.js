@@ -2,7 +2,7 @@
 
 const TYPE_LABEL = {
   "kibana": "Kibana",
-  "kibana-compq": "Kibana compq",
+  "kibana-compq": "Kibana (App)",
   "ui": "UI",
   "nifi": "NiFi",
   "nifi-registry": "Registry",
@@ -97,29 +97,23 @@ function getClient(name) {
 }
 
 /* ---- top nav (client chips) ---- */
+// A special-view nav chip: a colored dot (in the view's accent) + a noun label,
+// uniform across Prod / Repos / Builds / Settings so they read as one family.
+function navChip(cls, key, label) {
+  const c = el("a", "navchip " + cls + (selected === key ? " active" : ""));
+  c.append(el("span", "navdot"), document.createTextNode(label));
+  c.href = "#";
+  c.addEventListener("click", (e) => { e.preventDefault(); location.hash = key; });
+  return c;
+}
+
 function renderNav() {
   const nav = $("#nav");
   nav.innerHTML = "";
-  if (prodEntries().length) {
-    const pc = el("a", "navchip prod" + (selected === PROD_KEY ? " active" : ""), "★ All Prod");
-    pc.href = "#";
-    pc.addEventListener("click", (e) => { e.preventDefault(); location.hash = PROD_KEY; });
-    nav.append(pc);
-  }
-  if (repoList().length) {
-    const rc = el("a", "navchip repos" + (selected === REPOS_KEY ? " active" : ""), "⌥ Repos");
-    rc.href = "#";
-    rc.addEventListener("click", (e) => { e.preventDefault(); location.hash = REPOS_KEY; });
-    nav.append(rc);
-  }
-  const jc = el("a", "navchip jenkins" + (selected === JENKINS_KEY ? " active" : ""), "🔧 Jenkins");
-  jc.href = "#";
-  jc.addEventListener("click", (e) => { e.preventDefault(); location.hash = JENKINS_KEY; });
-  nav.append(jc);
-  const sc = el("a", "navchip settings" + (selected === SETTINGS_KEY ? " active" : ""), "⚙ Settings");
-  sc.href = "#";
-  sc.addEventListener("click", (e) => { e.preventDefault(); location.hash = SETTINGS_KEY; });
-  nav.append(sc);
+  if (prodEntries().length) nav.append(navChip("prod", PROD_KEY, "Prod"));
+  if (repoList().length) nav.append(navChip("repos", REPOS_KEY, "Repos"));
+  nav.append(navChip("jenkins", JENKINS_KEY, "Builds"));
+  nav.append(navChip("settings", SETTINGS_KEY, "Settings"));
   for (const client of CONFIG.clients) {
     const chip = el("a", "navchip" + (client.name === selected ? " active" : ""), client.name);
     chip.href = "#";
@@ -159,7 +153,7 @@ function renderPicker() {
   if (prod.length) {
     const pcard = el("button", "clientcard prodcard");
     pcard.dataset.text = "all prod production " + prod.map(p => p.client.name).join(" ").toLowerCase();
-    pcard.append(el("div", "cc-name", "★ All Prod"));
+    pcard.append(el("div", "cc-name", "All Prod"));
     pcard.append(el("div", "cc-count", prod.length + " production environments"));
     const chips = el("div", "cc-envs");
     for (const p of prod) {
@@ -178,7 +172,7 @@ function renderPicker() {
     const rcard = el("button", "clientcard repocard");
     rcard.dataset.text = "repos github code repositories " +
       repos.map(r => r.name).join(" ").toLowerCase();
-    rcard.append(el("div", "cc-name", "⌥ Repos"));
+    rcard.append(el("div", "cc-name", "Repos"));
     rcard.append(el("div", "cc-count", repos.length + " GitHub repositories"));
     rcard.append(el("div", "cc-sub", "reactorcx org · opens in Chrome, no VPN"));
     rcard.addEventListener("click", () => { location.hash = REPOS_KEY; });
@@ -187,7 +181,7 @@ function renderPicker() {
 
   const jcard = el("button", "clientcard jenkinscard");
   jcard.dataset.text = "jenkins build failure troubleshoot ci";
-  jcard.append(el("div", "cc-name", "🔧 Jenkins"));
+  jcard.append(el("div", "cc-name", "Builds"));
   jcard.append(el("div", "cc-count", "troubleshoot a build"));
   jcard.append(el("div", "cc-sub", "paste a build URL, or pick repo + branch → get the failure reason"));
   jcard.addEventListener("click", () => { location.hash = JENKINS_KEY; });
@@ -195,7 +189,7 @@ function renderPicker() {
 
   const scard = el("button", "clientcard settingscard");
   scard.dataset.text = "settings credentials github jenkins token config";
-  scard.append(el("div", "cc-name", "⚙ Settings"));
+  scard.append(el("div", "cc-name", "Settings"));
   scard.append(el("div", "cc-count", "credentials & sources"));
   scard.append(el("div", "cc-sub", "your GitHub + Jenkins logins; make this work on a shared copy"));
   scard.addEventListener("click", () => { location.hash = SETTINGS_KEY; });
@@ -240,7 +234,35 @@ function renderClientView(name) {
   const grid = el("div", "envgrid");
   for (const env of sortedEnvs(client)) grid.append(renderEnv(client, env));
   main.append(grid);
+  if (client.hidden && client.hidden.length) main.append(renderHiddenNote(client.hidden));
   refreshConnected();
+}
+
+// Environments the sync found but couldn't match to a VPN on this machine. Shown
+// so a missing env is explained (and fixable) instead of silently disappearing.
+function renderHiddenNote(hidden) {
+  const box = el("div", "hidden-note");
+  const n = hidden.length;
+  const summary = el("summary", "hidden-sum",
+    n + (n === 1 ? " environment hidden" : " environments hidden") + " — no VPN matched");
+  const det = el("details");
+  det.append(summary);
+  const list = el("div", "hidden-list");
+  for (const h of hidden) {
+    const row = el("div", "hidden-row");
+    row.append(el("span", "hidden-name", h.name));
+    row.append(el("span", "hidden-why", (h.reason || "no VPN matched") +
+      (h.tier ? " · tier " + h.tier : "")));
+    list.append(row);
+  }
+  det.append(list);
+  const tip = el("div", "hidden-tip");
+  tip.textContent = "These wiki environments have no matching NetworkManager VPN here. " +
+    "Run  python3 sync_wiki.py --vpns  to see your VPN names, or add an override in " +
+    "vpn_map.json, then press Sync.";
+  det.append(tip);
+  box.append(det);
+  return box;
 }
 
 function renderProdView() {
@@ -252,7 +274,7 @@ function renderProdView() {
   const back = el("button", "backbtn", "← Clients");
   back.addEventListener("click", showPicker);
   head.append(back);
-  head.append(el("h1", "page-title", "★ All Prod"));
+  head.append(el("h1", "page-title", "All Prod"));
   const entries = prodEntries();
   head.append(el("span", "count", entries.length + " clients"));
   main.append(head);
@@ -272,7 +294,7 @@ function renderReposView() {
   const back = el("button", "backbtn", "← Clients");
   back.addEventListener("click", showPicker);
   head.append(back);
-  head.append(el("h1", "page-title", "⌥ Repos"));
+  head.append(el("h1", "page-title", "Repos"));
   const repos = repoList();
   head.append(el("span", "count", repos.length + " repositories · reactorcx"));
   main.append(head);
@@ -370,13 +392,13 @@ async function renderJenkinsView() {
   const main = $("#main");
   main.innerHTML = "";
   $("#filter").value = "";
-  $("#filter").placeholder = "Jenkins troubleshooter (use the form below)";
+  $("#filter").placeholder = "Builds — use the form below";
 
   const head = el("div", "view-head");
   const back = el("button", "backbtn", "← Clients");
   back.addEventListener("click", showPicker);
   head.append(back);
-  head.append(el("h1", "page-title", "🔧 Jenkins"));
+  head.append(el("h1", "page-title", "Builds"));
   head.append(el("span", "count", "build a branch and watch the log, or diagnose a failure"));
   main.append(head);
 
@@ -752,7 +774,7 @@ async function renderSettingsView() {
   const back = el("button", "backbtn", "← Clients");
   back.addEventListener("click", showPicker);
   head.append(back);
-  head.append(el("h1", "page-title", "⚙ Settings"));
+  head.append(el("h1", "page-title", "Settings"));
   head.append(el("span", "count", "your logins & where the data comes from"));
   main.append(head);
 
@@ -766,6 +788,7 @@ async function renderSettingsView() {
   body.append(buildGithubSection(data));
   body.append(buildJenkinsSection(data));
   body.append(buildThemeSection());
+  body.append(buildDisplaySection());
   body.append(buildBrowserSection(data));
   body.append(buildSourcesSection(data));
 }
@@ -793,6 +816,27 @@ function buildThemeSection() {
     row.append(radio, txt);
     form.append(row);
   }
+  sec.append(form);
+  return sec;
+}
+
+function buildDisplaySection() {
+  const sec = setSection("Display",
+    "An optional frosted-glass look that layers over whichever theme you pick.");
+  const form = el("div", "set-form");
+  const row = el("label", "set-radio");
+  const cb = el("input"); cb.type = "checkbox"; cb.className = "set-check";
+  cb.checked = !!(window.__glassOn && window.__glassOn());
+  cb.addEventListener("change", () => {
+    if (window.__applyGlass) window.__applyGlass(cb.checked);
+    toast(cb.checked ? "Glass mode on" : "Glass mode off", "ok");
+  });
+  const txt = el("div", "set-radio-txt");
+  txt.append(el("div", "set-radio-title", "Glass (frosted panels)"),
+    el("div", "set-radio-desc",
+      "Translucent, blurred panels over a soft gradient — works on top of light or dark."));
+  row.append(cb, txt);
+  form.append(row);
   sec.append(form);
   return sec;
 }
@@ -840,6 +884,35 @@ function setSection(title, subtitle) {
   return sec;
 }
 
+// Read-only view (non-sensitive values) + an Edit button that reveals `form`
+// (which holds the editable inputs + Save). Cancel restores the view. A
+// successful Save re-renders the whole Settings view, which lands back here.
+function editToggle(sec, viewRows, form) {
+  const view = el("div", "set-view");
+  for (const [label, value, dim] of viewRows) {
+    const row = el("div", "set-vrow");
+    row.append(el("div", "set-vlabel", label));
+    row.append(el("div", "set-vval" + (dim ? " set-dim" : ""), value));
+    view.append(row);
+  }
+  const editBtn = el("button", "btn-ghost", "Edit");
+  const editRow = el("div", "set-editrow"); editRow.append(editBtn);
+  view.append(editRow);
+
+  const cancel = el("button", "btn-ghost", "Cancel");
+  form.append(cancel);
+  form.classList.add("hidden");
+
+  editBtn.addEventListener("click", () => {
+    view.classList.add("hidden"); form.classList.remove("hidden");
+    const first = form.querySelector("input"); if (first) first.focus();
+  });
+  cancel.addEventListener("click", () => {
+    form.classList.add("hidden"); view.classList.remove("hidden");
+  });
+  sec.append(view, form);
+}
+
 function buildGithubSection(data) {
   const gh = (data.github || {});
   const sec = setSection("GitHub",
@@ -862,17 +935,20 @@ function buildGithubSection(data) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ user: user.value.trim(), token: token.value }),
       });
-      if (r.ok) { toast("GitHub token saved — press Fetch latest to re-sync", "ok"); renderSettingsView(); }
+      if (r.ok) { toast("GitHub token saved — press Sync to re-pull", "ok"); renderSettingsView(); }
       else toast("Save failed", "err", r.error || "");
     } catch (e) { toast("Save failed", "err", String(e)); }
     finally { save.disabled = false; }
   });
   const form = el("div", "set-form");
-  form.append(labelRow("Username", user), labelRow("Token", token), save);
-  sec.append(form);
   const hint = el("div", "jk-hint");
   hint.textContent = "Create one at github.com/settings/tokens (classic, with 'repo' scope). Leave blank to keep using the gh CLI login.";
-  sec.append(hint);
+  form.append(labelRow("Username", user), labelRow("Token", token), hint, save);
+
+  editToggle(sec, [
+    ["Username", gh.user || "—"],
+    ["Token", gh.configured ? "•••••••• saved" : "not set", true],
+  ], form);
   return sec;
 }
 
@@ -905,12 +981,17 @@ function buildJenkinsSection(data) {
     finally { save.disabled = false; }
   });
   const form = el("div", "set-form");
-  form.append(labelRow("Jenkins URL", base), labelRow("User", user),
-    labelRow("Token", token), labelRow("VPN", vpn), save);
-  sec.append(form);
   const hint = el("div", "jk-hint");
-  hint.textContent = "VPN is the NetworkManager connection name to bring up before fetching (e.g. DEVOPS).";
-  sec.append(hint);
+  hint.textContent = "VPN is the NetworkManager connection name to bring up before fetching (e.g. DEVOPS). Use an API token (not your password) — /me/configure → API Token.";
+  form.append(labelRow("Jenkins URL", base), labelRow("User", user),
+    labelRow("Token", token), labelRow("VPN", vpn), hint, save);
+
+  editToggle(sec, [
+    ["Jenkins URL", jk.base || "https://jenkins.devops.lmvi.net"],
+    ["User", jk.user || "—"],
+    ["VPN", jk.vpn || "DEVOPS"],
+    ["Token", jk.configured ? "•••••••• saved" : "not set", true],
+  ], form);
   return sec;
 }
 
@@ -930,18 +1011,22 @@ function buildSourcesSection(data) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ github_org: org.value.trim(), wiki_url: wiki.value.trim(), jenkins_host_suffix: suffix.value.trim() }),
       });
-      if (r.ok) { toast("Sources saved — press Fetch latest to re-sync", "ok"); }
+      if (r.ok) { toast("Sources saved — press Sync to re-pull", "ok"); renderSettingsView(); }
       else toast("Save failed", "err", r.error || "");
     } catch (e) { toast("Save failed", "err", String(e)); }
     finally { save.disabled = false; }
   });
   const form = el("div", "set-form");
-  form.append(labelRow("GitHub org", org), labelRow("Wiki repo URL", wiki),
-    labelRow("Jenkins host suffix", suffix), save);
-  sec.append(form);
   const hint = el("div", "jk-hint");
   hint.textContent = "Jenkins host suffix is a safety allowlist — the server only fetches build logs from hosts ending in this domain.";
-  sec.append(hint);
+  form.append(labelRow("GitHub org", org), labelRow("Wiki repo URL", wiki),
+    labelRow("Jenkins host suffix", suffix), hint, save);
+
+  editToggle(sec, [
+    ["GitHub org", s.github_org || "—"],
+    ["Wiki repo URL", s.wiki_url || "—"],
+    ["Jenkins host suffix", s.jenkins_host_suffix || "—"],
+  ], form);
   return sec;
 }
 
@@ -967,7 +1052,10 @@ function renderEnv(client, env, titleOverride) {
 function renderLink(env, link) {
   const b = el("button", "linkbtn t-" + link.type);
   b.append(el("span", "swatch"));
-  b.append(el("span", "lbl", link.label));
+  // compq links carry cryptic wiki names (app-es, Kibana-compq-index…); they all
+  // point at the app Elasticsearch/Kibana, so show one clear label.
+  const label = link.type === "kibana-compq" ? "Kibana (App)" : link.label;
+  b.append(el("span", "lbl", label));
   b.append(el("span", "tp", TYPE_LABEL[link.type] || link.type));
   b.title = link.url;
   b.addEventListener("click", () => openLink(b, env, link));
@@ -1005,6 +1093,8 @@ async function openLink(btn, env, link) {
     if (res.ok) {
       const connected = env.vpn && res.vpnMessage !== "already connected";
       toast("Opened " + link.label, "ok", env.vpn ? (connected ? "VPN " + env.vpn + " connected" : env.vpn) : "");
+      btn.classList.remove("opened"); void btn.offsetWidth; btn.classList.add("opened");
+      setTimeout(() => btn.classList.remove("opened"), 1200);
       if (env.vpn) { activeVpns.add(env.vpn); refreshConnected(); }
       pollStatus();
     } else {
@@ -1092,15 +1182,15 @@ function applyFilter(q) {
 /* ---- sync ---- */
 async function doSync(btn) {
   btn.disabled = true;
-  btn.textContent = "Fetching…";
+  btn.textContent = "Syncing…";
   try {
     const res = await api("/api/sync", { method: "POST" });
-    if (res.ok) { toast("Fetched latest links & reloaded", "ok"); await loadConfig(); }
-    else toast("Fetch failed", "err", (res.output || res.error || "").slice(-200));
+    if (res.ok) { toast("Synced links & reloaded", "ok"); await loadConfig(); }
+    else toast("Sync failed", "err", (res.output || res.error || "").slice(-200));
   } catch (e) {
-    toast("Fetch request failed", "err", String(e));
+    toast("Sync request failed", "err", String(e));
   } finally {
-    btn.disabled = false; btn.textContent = "Fetch latest";
+    btn.disabled = false; btn.textContent = "Sync";
   }
 }
 

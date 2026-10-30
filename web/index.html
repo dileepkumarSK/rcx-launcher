@@ -5,28 +5,38 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RCX Env Launcher</title>
   <script>
-    // Apply the saved theme before first paint (no flash). "auto" follows the OS.
+    // Apply the saved theme + glass mode before first paint (no flash).
+    // Theme (auto/light/dark) and glass (on/off) are independent: glass is a
+    // frosted overlay that layers on top of whichever theme is active.
     (function () {
-      var KEY = "rcx-theme";
+      var TKEY = "rcx-theme", GKEY = "rcx-glass";
+      var root = document.documentElement;
       function resolve(choice) {
         if (choice === "light" || choice === "dark") return choice;
         return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
       }
-      window.__applyTheme = function (choice) {
-        try {
-          if (choice) localStorage.setItem(KEY, choice);
-        } catch (e) { /* private mode */ }
-        var c = choice || getChoice();
-        document.documentElement.setAttribute("data-theme", resolve(c));
-      };
-      function getChoice() {
-        try { return localStorage.getItem(KEY) || "auto"; } catch (e) { return "auto"; }
+      function themeChoice() {
+        try { return localStorage.getItem(TKEY) || "auto"; } catch (e) { return "auto"; }
       }
-      window.__themeChoice = getChoice;
-      document.documentElement.setAttribute("data-theme", resolve(getChoice()));
-      // React to OS changes while in "auto".
+      function glassOn() {
+        try { return localStorage.getItem(GKEY) === "on"; } catch (e) { return false; }
+      }
+      window.__themeChoice = themeChoice;
+      window.__glassOn = glassOn;
+      window.__applyTheme = function (choice) {
+        try { if (choice) localStorage.setItem(TKEY, choice); } catch (e) { /* private mode */ }
+        root.setAttribute("data-theme", resolve(choice || themeChoice()));
+      };
+      window.__applyGlass = function (on) {
+        try { localStorage.setItem(GKEY, on ? "on" : "off"); } catch (e) { /* private mode */ }
+        if (on) root.setAttribute("data-glass", "on");
+        else root.removeAttribute("data-glass");
+      };
+      root.setAttribute("data-theme", resolve(themeChoice()));
+      if (glassOn()) root.setAttribute("data-glass", "on");
+      // React to OS changes while the theme is on "auto".
       window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
-        if (getChoice() === "auto") document.documentElement.setAttribute("data-theme", resolve("auto"));
+        if (themeChoice() === "auto") root.setAttribute("data-theme", resolve("auto"));
       });
     })();
   </script>
@@ -41,7 +51,7 @@
     <input id="filter" type="search" placeholder="Filter clients, envs, links…  (/ to focus)" autocomplete="off">
     <div class="actions">
       <div id="status" class="status" title="Active VPNs"></div>
-      <button id="sync" class="btn-ghost" title="Pull the latest links from the wiki and reload">Fetch latest</button>
+      <button id="sync" class="btn-ghost" title="Pull the latest links from the wiki and reload">Sync</button>
     </div>
   </header>
 
