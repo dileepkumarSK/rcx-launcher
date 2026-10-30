@@ -50,6 +50,17 @@ PROD_ID_TO_CLIENT = {
 # Rank for ordering environments within a client.
 TIER_RANK = {"LOWER": 0, "PERF": 1, "PERF2": 2, "PROD": 3}
 
+# Tokens a VPN connection name may use for each tier. VPN names are chosen by each
+# person in NetworkManager, so the same lower env is "SEI LOWER" on one machine and
+# "SEI LLE" (lower-level environment) on another — list every spelling we've seen so
+# a colleague's naming still matches. Matched case/separator-insensitively (see norm).
+TIER_TOKENS = {
+    "LOWER": ("LOWER", "LLE", "LWR", "LOW"),
+    "PERF": ("PERF", "PRF"),
+    "PERF2": ("PERF2", "PRF2"),
+    "PROD": ("PROD", "PRD"),
+}
+
 # Backends whose rows belong to a different client than their name implies.
 # e.g. RCX-SEIInt (Sandbox/Staging, org ids 7in/sgthi) are actually 7GT.
 BACKEND_CLIENT_OVERRIDE = {
@@ -422,8 +433,9 @@ def assign_vpn(client, tier, vpns, vpn_map):
     if override is not None:
         return override or None  # "" in map means intentionally no VPN
     cnorm = norm(client)
-    tnorm = norm(tier)
-    candidates = [v for v in vpns if norm(v).startswith(cnorm) and tnorm in norm(v)]
+    tokens = TIER_TOKENS.get(tier, (norm(tier),))
+    candidates = [v for v in vpns
+                  if norm(v).startswith(cnorm) and any(t in norm(v) for t in tokens)]
     if candidates:
         return sorted(candidates, key=len)[0]
     # Fallback: a client whose VPN name carries no tier token (e.g. "DEV7",

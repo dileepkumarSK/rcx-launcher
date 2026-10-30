@@ -143,8 +143,28 @@ log underneath.
 ## Fixing / overriding a VPN mapping
 
 `sync_wiki.py` maps each environment to a NetworkManager VPN connection by matching
-`<CLIENT> <TIER>` (LOWER / PERF / PERF2 / PROD) against your `nmcli` connections. To
-force a specific mapping, add entries to `vpn_map.json` keyed by `"<Client>:<TIER>"`:
+`<CLIENT> <TIER>` against your `nmcli` connections. **Each person names their VPNs
+themselves, so matching is name-based and machine-specific** — if a colleague's lower-env
+VPN doesn't match, that environment silently disappears for them (it won't show up).
+
+The tier is recognized from several common spellings (case/spacing don't matter):
+
+| Tier   | VPN-name tokens accepted            |
+|--------|-------------------------------------|
+| LOWER  | `LOWER`, `LLE`, `LWR`, `LOW`         |
+| PERF   | `PERF`, `PRF`                        |
+| PERF2  | `PERF2`, `PRF2`                      |
+| PROD   | `PROD`, `PRD`                        |
+
+So `TA LOWER`, `TA LLE`, and `TA-LWR` all map to TA's lower environments. If your VPN uses
+a spelling not listed here, either rename the connection or add an override below.
+
+> **Sharing note:** `config.json` is generated per machine from *that machine's* VPN names,
+> and it's git-ignored. A colleague must (1) `git pull` the latest code, then (2) press
+> **Fetch latest** (or run `sync_wiki.py`) on their own machine for their VPN names to be
+> picked up.
+
+To force a specific mapping, add entries to `vpn_map.json` keyed by `"<Client>:<TIER>"`:
 
 ```json
 {
