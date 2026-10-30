@@ -227,6 +227,20 @@ def norm(s):
     return re.sub(r"[^A-Z0-9]", "", s.upper())
 
 
+# Tier priority for reading a tier out of a VPN name (most specific first, so
+# "SEI PERF2" reads as PERF2 not PERF, and a bare "... LLE" reads as LOWER).
+_TIER_READ_ORDER = ("PERF2", "PROD", "PERF", "LOWER")
+
+
+def tier_in_vpn(name):
+    """Best-effort: which tier does this VPN connection name look like? or None."""
+    n = norm(name)
+    for tier in _TIER_READ_ORDER:
+        if any(tok in n for tok in TIER_TOKENS[tier]):
+            return tier
+    return None
+
+
 def is_ui(name, url):
     """True for web UI / portal rows (main app UI, FeedX UI, membercare portal…)."""
     host = re.sub(r"^https?://", "", url).split("/")[0].lower()
@@ -457,6 +471,70 @@ def tier_of_env(env_name, source_tier):
     return "LOWER"
 
 
+def _common_prefix_len(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def vpn_report(clients, vpns, vpn_map):
+    """Read the mapping from the VPN side and print what matched / what didn't.
+
+    Each person names their nmcli VPN connections themselves, so a wiki client or
+    tier can silently fail to match a colleague's naming. This surfaces both sides:
+    which VPNs went unused, and which client/tier combos found no VPN -- with a
+    ready-to-paste vpn_map.json line to fix each one.
+    """
+    # What sync wanted, and what it resolved to.
+    used = {}        # vpn name -> list of "Client/TIER" that use it
+    dropped = []     # (client, tier) that resolved to no VPN
+    for client in sorted(clients, key=str.upper):
+        for env in clients[client].values():
+            tier = env["tier"]
+            if env["vpn"]:
+                used.setdefault(env["vpn"], []).append(f"{client}/{tier}")
+            else:
+                if (client, tier) not in dropped:
+                    dropped.append((client, tier))
+
+    print("\n--- VPN mapping report (read from nmcli) ---")
+    print(f"{len(vpns)} VPN connection(s) on this machine.")
+
+    unused = [v for v in vpns if v not in used]
+    if unused:
+        print(f"\n{len(unused)} VPN(s) not matched to any environment:")
+        for v in sorted(unused, key=str.upper):
+            t = tier_in_vpn(v)
+            print(f"  • {v}" + (f"   (looks like tier {t})" if t else ""))
+
+    if dropped:
+        print(f"\n{len(dropped)} client/tier(s) found NO VPN (their environments are dropped):")
+        for client, tier in sorted(dropped):
+            cnorm = norm(client)
+            toks = TIER_TOKENS.get(tier, (norm(tier),))
+            # Rank unused VPNs as likely matches: same tier first, then closest
+            # client-name prefix. This is what a colleague would pick as the fix.
+            def score(v):
+                vn = norm(v)
+                same_tier = tier_in_vpn(v) == tier
+                return (same_tier, _common_prefix_len(vn, cnorm))
+            guesses = [v for v in sorted(unused, key=score, reverse=True)
+                       if score(v)[0] or score(v)[1] > 0][:3]
+            print(f"  • {client}/{tier}: no match")
+            if guesses:
+                best = guesses[0]
+                print(f"      maybe one of: {', '.join(guesses)}")
+                print(f'      to force it, add to vpn_map.json:  "{client}:{tier}": "{best}"')
+            else:
+                print(f"      (no VPN on this machine looks like {client} {tier})")
+    else:
+        print("\nEvery wanted client/tier matched a VPN. ✓")
+    print("--- end VPN report ---")
+
+
 def main():
     global WIKI_URL, GITHUB_ORG
     settings = load_settings()
@@ -549,6 +627,28 @@ def main():
     print(f"  {len(out_clients)} clients, {n_env} environments, {n_link} links "
           f"({dropped} env(s) dropped for having no VPN), {len(repos)} repos.")
 
+    vpn_report(clients, vpns, vpn_map)
+
+
+def vpns_only():
+    """Read-only: just show the VPN names on this machine and how they parse.
+
+    No wiki/credentials needed -- handy for a colleague to see what naming the
+    tool sees, and to copy exact connection names into vpn_map.json.
+    """
+    vpns = list_vpns()
+    print(f"{len(vpns)} VPN connection(s) from nmcli:\n")
+    for v in sorted(vpns, key=str.upper):
+        t = tier_in_vpn(v)
+        print(f"  {v:<28} -> tier {t or '?'}")
+    print("\nThe tool matches a VPN when its name starts with the client name and")
+    print("contains a tier token (LOWER/LLE/LWR/LOW, PERF/PRF, PERF2, PROD/PRD).")
+    print("If a name doesn't fit that, add an override in vpn_map.json, e.g.")
+    print('  "7GT:LOWER": "SevenGT Lower"')
+
 
 if __name__ == "__main__":
-    main()
+    if "--vpns" in sys.argv[1:]:
+        vpns_only()
+    else:
+        main()

@@ -164,6 +164,29 @@ a spelling not listed here, either rename the connection or add an override belo
 > **Fetch latest** (or run `sync_wiki.py`) on their own machine for their VPN names to be
 > picked up.
 
+### Seeing what matched (read from the VPN side)
+
+The client **name** in a VPN can differ per machine too (e.g. `7GT Lower` vs
+`SevenGT Lower`), so an environment can still disappear silently. To see exactly what
+your machine's VPN names are and how the tool reads them — no wiki/credentials needed:
+
+```bash
+python3 sync_wiki.py --vpns
+```
+
+And every full sync now **prints a VPN mapping report** at the end: which VPNs went
+**unused**, and which `Client/TIER` combos found **no VPN** — each with a ready-to-paste
+`vpn_map.json` line, e.g.:
+
+```
+7GT/LOWER: no match
+    maybe one of: SevenGT Lower
+    to force it, add to vpn_map.json:  "7GT:LOWER": "SevenGT Lower"
+```
+
+So instead of an environment just vanishing, the report tells you which of *your* VPN
+connections to map it to. Copy that line into `vpn_map.json` and re-run.
+
 To force a specific mapping, add entries to `vpn_map.json` keyed by `"<Client>:<TIER>"`:
 
 ```json
