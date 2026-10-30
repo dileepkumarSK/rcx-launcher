@@ -19,6 +19,35 @@
   --t-nifi-registry: #2f6fd1;
   --t-grafana: #bc4c00;
   --t-jenkins: #0a7ea4;
+
+  --topbar-bg: rgba(255,255,255,.9);
+}
+
+/* Dark theme — the boot script sets data-theme="dark" on <html>
+   (resolving "auto" from the OS). Only the palette tokens change. */
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --bg-elev: #161b22;
+  --bg-elev2: #1c2330;
+  --border: #30363d;
+  --border-soft: #262c34;
+  --text: #e6edf3;
+  --text-dim: #9da7b3;
+  --text-faint: #6e7781;
+  --accent: #4493f8;
+  --green: #3fb950;
+  --red: #f85149;
+  --amber: #d29922;
+
+  --t-kibana: #39c0b0;
+  --t-kibana-compq: #a371f7;
+  --t-ui: #f778ba;
+  --t-nifi: #4493f8;
+  --t-nifi-registry: #6ca8ff;
+  --t-grafana: #f0883e;
+  --t-jenkins: #39b4d6;
+
+  --topbar-bg: rgba(22,27,34,.9);
 }
 
 * { box-sizing: border-box; }
@@ -35,7 +64,7 @@ body {
   position: sticky; top: 0; z-index: 20;
   display: flex; align-items: center; gap: 16px;
   padding: 10px 18px;
-  background: rgba(255,255,255,.9);
+  background: var(--topbar-bg);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
 }

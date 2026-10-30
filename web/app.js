@@ -765,8 +765,36 @@ async function renderSettingsView() {
   body.innerHTML = "";
   body.append(buildGithubSection(data));
   body.append(buildJenkinsSection(data));
+  body.append(buildThemeSection());
   body.append(buildBrowserSection(data));
   body.append(buildSourcesSection(data));
+}
+
+function buildThemeSection() {
+  const current = (window.__themeChoice ? window.__themeChoice() : "auto");
+  const sec = setSection("Theme", "How the launcher itself looks.");
+  const form = el("div", "set-form");
+  const choices = [
+    ["auto", "Match system (recommended)",
+      "Follows your OS light/dark setting, and switches live when it changes."],
+    ["light", "Light", "Always use the light theme."],
+    ["dark", "Dark", "Always use the dark theme."],
+  ];
+  for (const [val, title, desc] of choices) {
+    const row = el("label", "set-radio");
+    const radio = el("input"); radio.type = "radio"; radio.name = "themepref"; radio.value = val;
+    if (val === current) radio.checked = true;
+    radio.addEventListener("change", () => {
+      if (window.__applyTheme) window.__applyTheme(val);
+      toast("Theme set to " + title.replace(" (recommended)", ""), "ok");
+    });
+    const txt = el("div", "set-radio-txt");
+    txt.append(el("div", "set-radio-title", title), el("div", "set-radio-desc", desc));
+    row.append(radio, txt);
+    form.append(row);
+  }
+  sec.append(form);
+  return sec;
 }
 
 function buildBrowserSection(data) {

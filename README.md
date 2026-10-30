@@ -88,8 +88,9 @@ bookmarkable by hash:
   Click the **★ star** on any repo to favorite it — favorites collect in a **★ Favorites**
   bucket at the top and are saved in `favorites.json`.
 - **🔧 Jenkins** (`#@jenkins`) — troubleshoot a build; see below.
-- **⚙ Settings** (`#@settings`) — your GitHub + Jenkins logins, which **browser** opens
-  the links (your system default by default, or force Chrome), and the data sources.
+- **⚙ Settings** (`#@settings`) — your GitHub + Jenkins logins, the **theme** (match
+  system / light / dark), which **browser** opens the links (your system default by
+  default, or force Chrome), and the data sources.
 
 Environments with no matching VPN are intentionally omitted.
 
@@ -219,6 +220,9 @@ Then re-run `sync_wiki.py`.
 ## Notes
 
 - Nothing is exposed off `127.0.0.1`; there's no auth because it's single-user/local.
+- **Theme** — **⚙ Settings → Theme** switches between **Match system** (follows your OS
+  light/dark and updates live), **Light**, and **Dark**. The choice is saved in the browser
+  (localStorage) and applied before the page paints, so there's no flash.
 - Link pages open in your **system default browser** by default (via `xdg-open`). You can
   switch to **Google Chrome / Chromium** in **⚙ Settings → Browser** — that forces Chrome so
   pages land in your logged-in Chrome profile (where you're already signed in to Kibana/NiFi).

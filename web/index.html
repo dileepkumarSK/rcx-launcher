@@ -4,6 +4,32 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RCX Env Launcher</title>
+  <script>
+    // Apply the saved theme before first paint (no flash). "auto" follows the OS.
+    (function () {
+      var KEY = "rcx-theme";
+      function resolve(choice) {
+        if (choice === "light" || choice === "dark") return choice;
+        return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+      window.__applyTheme = function (choice) {
+        try {
+          if (choice) localStorage.setItem(KEY, choice);
+        } catch (e) { /* private mode */ }
+        var c = choice || getChoice();
+        document.documentElement.setAttribute("data-theme", resolve(c));
+      };
+      function getChoice() {
+        try { return localStorage.getItem(KEY) || "auto"; } catch (e) { return "auto"; }
+      }
+      window.__themeChoice = getChoice;
+      document.documentElement.setAttribute("data-theme", resolve(getChoice()));
+      // React to OS changes while in "auto".
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
+        if (getChoice() === "auto") document.documentElement.setAttribute("data-theme", resolve("auto"));
+      });
+    })();
+  </script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>

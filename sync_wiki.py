@@ -443,20 +443,37 @@ def parse_prod(path):
 # ---- VPN assignment ----
 
 def assign_vpn(client, tier, vpns, vpn_map):
+    """Pick the nmcli VPN for a (client, tier). The client name is the anchor:
+
+    - one VPN for the client  -> use it for every env, whatever its tier spelling
+      (so a colleague's "TA" / "TA-LLE" style naming never drops an env);
+    - several VPNs for the client -> still route each env to its own tier, so a
+      prod/perf env doesn't open on the lower-env VPN (different tunnel).
+    """
     override = vpn_map.get(f"{client}:{tier}")
     if override is not None:
         return override or None  # "" in map means intentionally no VPN
     cnorm = norm(client)
+    owned = [v for v in vpns if norm(v).startswith(cnorm)]
+    if not owned:
+        return None
+    if len(owned) == 1:
+        return owned[0]  # client name alone decides it
+
+    # Client has several VPNs -> match the tier within them.
     tokens = TIER_TOKENS.get(tier, (norm(tier),))
-    candidates = [v for v in vpns
-                  if norm(v).startswith(cnorm) and any(t in norm(v) for t in tokens)]
-    if candidates:
-        return sorted(candidates, key=len)[0]
-    # Fallback: a client whose VPN name carries no tier token (e.g. "DEV7",
-    # "DEMO", "AT&T"). Only safe when exactly one VPN matches the client.
-    client_only = [v for v in vpns if norm(v).startswith(cnorm)]
-    if len(client_only) == 1:
-        return client_only[0]
+    tiered = [v for v in owned if any(t in norm(v) for t in tokens)]
+    if not tiered:
+        tiered = [v for v in owned if tier_in_vpn(v) == tier]
+    if tiered:
+        return sorted(tiered, key=len)[0]
+    # Requested tier isn't spelled out on any of this client's VPNs. For a lower
+    # env, fall back to a VPN that reads as lower (or carries no tier); never route
+    # a prod/perf env onto another tunnel -> leave it unmatched (report flags it).
+    if tier == "LOWER":
+        plain = [v for v in owned if tier_in_vpn(v) in (None, "LOWER")]
+        if plain:
+            return sorted(plain, key=len)[0]
     return None
 
 
