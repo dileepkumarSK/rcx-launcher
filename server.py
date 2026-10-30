@@ -38,7 +38,7 @@ DEFAULT_SETTINGS = {
     "github_org": "reactorcx",
     "wiki_url": "https://github.com/reactorcx/rcx-devops.wiki.git",
     "jenkins_host_suffix": "devops.lmvi.net",  # only fetch builds from this domain
-    "browser": "chrome",  # "chrome" = logged-in Chrome/Chromium; "default" = system default (xdg-open)
+    "browser": "default",  # "default" = system default browser (xdg-open); "chrome" = logged-in Chrome/Chromium
 }
 
 
@@ -511,20 +511,20 @@ def _spawn(argv):
 
 
 def open_url(url):
-    """Open a URL in the configured browser. 'chrome' (default) uses the detected
-    Chrome/Chromium so pages land in your already-logged-in profile; 'default'
-    uses the system default browser via xdg-open. Chrome mode falls back to the
-    system default if no Chrome/Chromium is installed."""
-    pref = load_settings().get("browser", "chrome")
-    if pref == "default":
-        if not shutil.which("xdg-open"):
-            return False, "system default browser unavailable (xdg-open missing)"
+    """Open a URL in the configured browser. 'default' (the default) uses the
+    system default browser via xdg-open; 'chrome' uses the detected Chrome/Chromium
+    so pages land in your already-logged-in profile. Each mode falls back to the
+    other if its opener isn't available."""
+    pref = load_settings().get("browser", "default")
+    if pref == "chrome":
+        if CHROME:
+            return _spawn([CHROME, url])
+        # Chrome not installed → fall back to the system default
+    if shutil.which("xdg-open"):
         return _spawn(["xdg-open", url])
-    if CHROME:
+    if CHROME:                            # no xdg-open → fall back to Chrome
         return _spawn([CHROME, url])
-    if shutil.which("xdg-open"):          # Chrome not installed → use system default
-        return _spawn(["xdg-open", url])
-    return False, "Chrome not found on this machine"
+    return False, "no browser available (install a browser, or xdg-open)"
 
 
 class Handler(BaseHTTPRequestHandler):

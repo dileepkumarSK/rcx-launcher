@@ -89,7 +89,7 @@ bookmarkable by hash:
   bucket at the top and are saved in `favorites.json`.
 - **🔧 Jenkins** (`#@jenkins`) — troubleshoot a build; see below.
 - **⚙ Settings** (`#@settings`) — your GitHub + Jenkins logins, which **browser** opens
-  the links (Chrome by default, or your system default), and the data sources.
+  the links (your system default by default, or force Chrome), and the data sources.
 
 Environments with no matching VPN are intentionally omitted.
 
@@ -176,11 +176,11 @@ Then re-run `sync_wiki.py`.
 ## Notes
 
 - Nothing is exposed off `127.0.0.1`; there's no auth because it's single-user/local.
-- Link pages open in your **default Chrome profile** (where you're already logged in);
-  the launcher window itself uses a separate profile so it stays its own app. You can
-  switch link-opening to your **system default browser** in **⚙ Settings → Browser**
-  (uses `xdg-open`); Chrome mode also falls back to the system default if no
-  Chrome/Chromium is installed.
+- Link pages open in your **system default browser** by default (via `xdg-open`). You can
+  switch to **Google Chrome / Chromium** in **⚙ Settings → Browser** — that forces Chrome so
+  pages land in your logged-in Chrome profile (where you're already signed in to Kibana/NiFi).
+  Each mode falls back to the other if its opener isn't installed. The launcher **window**
+  itself still uses Chrome's app-mode (separate profile) so it stays its own app.
 - VPNs are brought **up** on demand; other VPNs are left connected (no auto-disconnect).
   If an `nmcli` connection needs a password it isn't storing, NetworkManager will prompt;
   if it can't connect non-interactively the button reports the `nmcli` error.

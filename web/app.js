@@ -771,16 +771,16 @@ async function renderSettingsView() {
 
 function buildBrowserSection(data) {
   const s = (data.settings || {});
-  const current = s.browser === "default" ? "default" : "chrome";
+  const current = s.browser === "chrome" ? "chrome" : "default";
   const sec = setSection("Browser",
     "Which browser opens the Kibana / UI / NiFi links when you click them.");
 
   const form = el("div", "set-form");
   const choices = [
+    ["default", "System default browser (recommended)",
+      "Opens in whatever browser your system is set to (Firefox, Edge, Chrome, …) via xdg-open."],
     ["chrome", "Google Chrome / Chromium",
-      "Opens in your logged-in Chrome profile (recommended — you stay signed in to Kibana/NiFi)."],
-    ["default", "System default browser",
-      "Opens in whatever browser your system is set to (Firefox, Edge, etc.) via xdg-open."],
+      "Forces Chrome/Chromium — opens in your logged-in Chrome profile so you stay signed in to Kibana/NiFi."],
   ];
   for (const [val, title, desc] of choices) {
     const row = el("label", "set-radio");
