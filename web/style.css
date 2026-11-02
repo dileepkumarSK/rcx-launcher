@@ -19,6 +19,8 @@
   --t-nifi-registry: #2f6fd1;
   --t-grafana: #bc4c00;
   --t-jenkins: #0a7ea4;
+  --t-kafka: #6b4ae0;
+  --t-mongo: #12a150;
 
   --topbar-bg: rgba(255,255,255,.9);
   --linkbtn-hover: #e4eaf1;
@@ -48,6 +50,8 @@
   --t-nifi-registry: #6ca8ff;
   --t-grafana: #f0883e;
   --t-jenkins: #39b4d6;
+  --t-kafka: #9f86ff;
+  --t-mongo: #3fcf7a;
 
   --topbar-bg: rgba(22,27,34,.9);
   --linkbtn-hover: #262f3d;
@@ -220,6 +224,10 @@ body {
 .navchip.repos.active { color: #fff; background: var(--t-kibana-compq); border-color: var(--t-kibana-compq); }
 .navchip.jenkins { color: var(--t-jenkins); }
 .navchip.jenkins.active { color: #fff; background: var(--t-jenkins); border-color: var(--t-jenkins); }
+.navchip.kafka { color: var(--t-kafka); }
+.navchip.kafka.active { color: #fff; background: var(--t-kafka); border-color: var(--t-kafka); }
+.navchip.mongo { color: var(--t-mongo); }
+.navchip.mongo.active { color: #fff; background: var(--t-mongo); border-color: var(--t-mongo); }
 .navchip.settings { color: var(--text-dim); }
 .navchip.settings.active { color: #fff; background: var(--text-dim); border-color: var(--text-dim); }
 
@@ -349,6 +357,58 @@ body {
 }
 .clientcard.jenkinscard .cc-name { color: var(--t-jenkins); }
 
+.clientcard.kafkacard { border-color: var(--t-kafka);
+  background: linear-gradient(180deg, rgba(107,74,224,.06), var(--bg-elev)); }
+.clientcard.kafkacard:hover { border-color: var(--t-kafka); box-shadow: 0 6px 18px rgba(107,74,224,.15); }
+.clientcard.kafkacard .cc-name { color: var(--t-kafka); }
+.clientcard.mongocard { border-color: var(--t-mongo);
+  background: linear-gradient(180deg, rgba(18,161,80,.06), var(--bg-elev)); }
+.clientcard.mongocard:hover { border-color: var(--t-mongo); box-shadow: 0 6px 18px rgba(18,161,80,.15); }
+.clientcard.mongocard .cc-name { color: var(--t-mongo); }
+
+/* ---- Kafka / Mongo cert bundles ---- */
+.certs-root { color: var(--text-dim); font-size: 12.5px; margin: 2px 0 16px; }
+.certs-root code { background: var(--bg-elev2); padding: 1px 6px; border-radius: 5px; }
+.certs-group { margin-bottom: 20px; }
+.certs-client {
+  font-size: 13px; font-weight: 700; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: .5px; margin: 0 0 9px;
+  padding-bottom: 5px; border-bottom: 1px solid var(--border);
+}
+.certs-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+}
+.certcard {
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px 13px 13px;
+}
+.certcard-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+.certcard-name { font-weight: 650; font-size: 14px; word-break: break-word; }
+.certcard-files { margin-left: auto; font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.certcard-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.certpanel { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
+.cert-kv { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; }
+.cert-k {
+  flex: none; width: 108px; color: var(--text-dim); font-size: 11px;
+  font-weight: 600; text-transform: uppercase; letter-spacing: .3px;
+}
+.cert-v { flex: 1; font-size: 13px; color: var(--text); word-break: break-all; }
+.cert-mini {
+  flex: none; font-size: 11px; font-weight: 600; cursor: pointer;
+  color: var(--accent); background: var(--bg-elev2);
+  border: 1px solid var(--border-soft); border-radius: 6px; padding: 1px 8px;
+}
+.cert-mini:hover { border-color: var(--accent); }
+.cert-uri { margin: 10px 0 2px; }
+.cert-uri .cert-k { width: auto; margin-bottom: 5px; }
+.cert-uri-box {
+  width: 100%; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px; color: var(--text); background: var(--bg-elev2);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+}
+.cert-hint { color: var(--text-dim); font-size: 12px; margin-top: 10px; line-height: 1.5; }
+
 /* ---- Jenkins troubleshooter ---- */
 .jk-auth {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -422,6 +482,38 @@ body {
 .jk-badge.bad { background: var(--red); }
 .jk-badge.warn { background: var(--amber); }
 .jk-name { font-weight: 600; color: var(--text); font-size: 14px; }
+
+/* build-details card (number / result / duration / when / trigger / last success) */
+.jk-info {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 14px; margin-bottom: 12px; background: var(--bg-elev2);
+  display: grid; grid-template-columns: max-content 1fr; gap: 5px 16px; align-items: baseline;
+}
+.jk-info-ok { border-color: rgba(26,127,55,.45); background: rgba(26,127,55,.08); }
+.jk-info-bad { border-color: rgba(207,34,46,.4); background: rgba(207,34,46,.06); }
+.jk-irow { display: contents; }
+.jk-ilabel {
+  color: var(--text-dim); font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .4px;
+}
+.jk-ival { color: var(--text); font-size: 13px; }
+.jk-ival.jk-ok { color: var(--green); font-weight: 700; }
+.jk-ival.jk-bad { color: var(--red); font-weight: 700; }
+.jk-ival.jk-warn { color: var(--amber); font-weight: 700; }
+.jk-ival.jk-mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+
+/* build parameters disclosure */
+.jk-params { margin-bottom: 12px; }
+.jk-params > summary {
+  cursor: pointer; color: var(--text-dim); font-size: 12.5px; font-weight: 600;
+}
+.jk-pgrid {
+  margin-top: 8px; display: grid; grid-template-columns: max-content 1fr;
+  gap: 4px 14px; align-items: baseline;
+}
+.jk-pname { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--text-dim); }
+.jk-pval { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--text); word-break: break-all; }
+
 .jk-stages { font-size: 13px; margin-bottom: 10px; }
 .jk-stages-h { color: var(--text-dim); }
 
@@ -592,5 +684,6 @@ body {
 .toast.ok { border-left-color: var(--green); }
 .toast.err { border-left-color: var(--red); }
 .toast.info { border-left-color: var(--amber); }
+.toast.warn { border-left-color: var(--amber); }
 .toast .sub { color: var(--text-dim); font-size: 12px; margin-top: 2px; }
 @keyframes slidein { from { opacity: 0; transform: translateX(12px); } }

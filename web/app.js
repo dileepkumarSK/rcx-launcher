@@ -18,6 +18,8 @@ const ENV_ORDER = [
 const PROD_KEY = "@prod"; // sentinel "client" = the all-prod view
 const REPOS_KEY = "@repos"; // sentinel "client" = the GitHub repos view
 const JENKINS_KEY = "@jenkins"; // sentinel "client" = the Jenkins troubleshooter
+const KAFKA_KEY = "@kafka"; // sentinel "client" = the Kafka certs view
+const MONGO_KEY = "@mongo"; // sentinel "client" = the Mongo certs view
 const SETTINGS_KEY = "@settings"; // sentinel "client" = the Settings view
 
 let CONFIG = { clients: [], repos: [] };
@@ -26,6 +28,7 @@ let favorites = new Set(); // favorite repo names
 let jkRepoMap = null;       // repo display label -> job url
 let jkBranchMap = {};       // branch name -> job url (for the selected repo)
 let jkPoll = null;          // timer id for the active build-status poll
+let certApps = {};          // which desktop clients are installed (offsetexplorer/compass)
 let selected = null; // client name, PROD_KEY, REPOS_KEY, JENKINS_KEY, or null for the picker
 
 function repoList() { return CONFIG.repos || []; }
@@ -113,6 +116,8 @@ function renderNav() {
   if (prodEntries().length) nav.append(navChip("prod", PROD_KEY, "Prod"));
   if (repoList().length) nav.append(navChip("repos", REPOS_KEY, "Repos"));
   nav.append(navChip("jenkins", JENKINS_KEY, "Builds"));
+  nav.append(navChip("kafka", KAFKA_KEY, "Kafka"));
+  nav.append(navChip("mongo", MONGO_KEY, "Mongo"));
   nav.append(navChip("settings", SETTINGS_KEY, "Settings"));
   for (const client of CONFIG.clients) {
     const chip = el("a", "navchip" + (client.name === selected ? " active" : ""), client.name);
@@ -128,6 +133,8 @@ function render() {
   if (selected === PROD_KEY) renderProdView();
   else if (selected === REPOS_KEY) renderReposView();
   else if (selected === JENKINS_KEY) renderJenkinsView();
+  else if (selected === KAFKA_KEY) renderCertsView("kafka");
+  else if (selected === MONGO_KEY) renderCertsView("mongo");
   else if (selected === SETTINGS_KEY) renderSettingsView();
   else if (selected && getClient(selected)) renderClientView(selected);
   else renderPicker();
@@ -186,6 +193,22 @@ function renderPicker() {
   jcard.append(el("div", "cc-sub", "paste a build URL, or pick repo + branch → get the failure reason"));
   jcard.addEventListener("click", () => { location.hash = JENKINS_KEY; });
   grid.append(jcard);
+
+  const kcard = el("button", "clientcard kafkacard");
+  kcard.dataset.text = "kafka certs offset explorer truststore keystore jks cluster";
+  kcard.append(el("div", "cc-name", "Kafka"));
+  kcard.append(el("div", "cc-count", "cert bundles → Offset Explorer"));
+  kcard.append(el("div", "cc-sub", "pick a bundle → copy the cluster + keystore/truststore settings"));
+  kcard.addEventListener("click", () => { location.hash = KAFKA_KEY; });
+  grid.append(kcard);
+
+  const mcard = el("button", "clientcard mongocard");
+  mcard.dataset.text = "mongo mongodb certs compass pem connection string";
+  mcard.append(el("div", "cc-name", "Mongo"));
+  mcard.append(el("div", "cc-count", "cert bundles → Compass"));
+  mcard.append(el("div", "cc-sub", "pick a bundle → copy a mongodb:// URI or make a Compass import"));
+  mcard.addEventListener("click", () => { location.hash = MONGO_KEY; });
+  grid.append(mcard);
 
   const scard = el("button", "clientcard settingscard");
   scard.dataset.text = "settings credentials github jenkins token config";
@@ -604,6 +627,34 @@ async function runDiagnose(btn, body) {
   }
 }
 
+function fmtDur(ms) {
+  if (ms == null || ms < 0) return "—";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60), r = s % 60;
+  if (m < 60) return r ? m + "m " + r + "s" : m + "m";
+  const h = Math.floor(m / 60);
+  return h + "h " + (m % 60) + "m";
+}
+function fmtAgo(ts) {
+  if (!ts) return "";
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + " min ago";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.floor(h / 24) + "d ago";
+}
+function fmtWhen(ts) {
+  if (!ts) return "";
+  try {
+    return new Date(ts).toLocaleString([], {
+      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    });
+  } catch (e) { return ""; }
+}
+
 function renderJkResult(out, res) {
   out.innerHTML = "";
   if (!res.ok) {
@@ -624,6 +675,66 @@ function renderJkResult(out, res) {
   open.addEventListener("click", () => openRaw(res.url || res.requestUrl));
   rhead.append(open);
   out.append(rhead);
+
+  // Build-details card — number / result / duration / when / trigger, plus the
+  // job's last successful build, so you see the outcome at a glance, not just logs.
+  const card = el("div", "jk-info jk-info-" + cls);
+  const addRow = (label, value, vcls) => {
+    if (value == null || value === "") return;
+    const row = el("div", "jk-irow");
+    row.append(el("span", "jk-ilabel", label));
+    const v = el("span", "jk-ival" + (vcls ? " " + vcls : ""));
+    if (value instanceof Node) v.append(value); else v.textContent = value;
+    row.append(v);
+    card.append(row);
+  };
+  if (res.number != null) addRow("Build", "#" + res.number);
+  addRow("Result", result, cls === "ok" ? "jk-ok" : (cls === "bad" ? "jk-bad" : "jk-warn"));
+  if (res.version) {
+    const src = res.versionSource && !["parameter", "image"].includes(res.versionSource)
+      ? "  (" + res.versionSource + ")" : "";
+    addRow("Version", res.version + src, "jk-ok");
+  }
+  if (res.image) addRow("Image", res.image, "jk-mono");
+  const scm = res.scm || {};
+  if (scm.branch || scm.commit) {
+    addRow("Commit", (scm.branch || "") + (scm.commit ? (scm.branch ? " @ " : "") + scm.commit : ""));
+  }
+  if (!res.building && res.duration) addRow("Duration", fmtDur(res.duration));
+  if (res.building && res.estimatedDuration) addRow("Est. time", "~" + fmtDur(res.estimatedDuration));
+  if (res.timestamp) {
+    const end = res.building ? res.timestamp : res.timestamp + (res.duration || 0);
+    const when = fmtWhen(end);
+    addRow(res.building ? "Started" : "Finished", fmtAgo(end) + (when ? " · " + when : ""));
+  }
+  if (res.cause) addRow("Trigger", res.cause);
+  const ls = (res.job || {}).lastSuccess;
+  if (ls && ls.number != null) {
+    const same = ls.number === res.number;
+    const span = el("span");
+    span.textContent = "#" + ls.number +
+      (ls.timestamp ? " · " + fmtAgo(ls.timestamp) : "") +
+      (ls.duration ? " · " + fmtDur(ls.duration) : "") + (same ? " (this build)" : "");
+    if (ls.url && !same) {
+      const o = el("button", "jk-link", " open ↗");
+      o.addEventListener("click", () => openRaw(ls.url));
+      span.append(o);
+    }
+    addRow("Last success", span, "jk-ok");
+  }
+  if (card.childNodes.length) out.append(card);
+
+  if (res.params && res.params.length) {
+    const det = el("details", "jk-params");
+    det.append(el("summary", null, "Parameters (" + res.params.length + ")"));
+    const pg = el("div", "jk-pgrid");
+    for (const p of res.params) {
+      pg.append(el("span", "jk-pname", p.name));
+      pg.append(el("span", "jk-pval", p.value || "—"));
+    }
+    det.append(pg);
+    out.append(det);
+  }
 
   if (res.building) out.append(el("div", "jk-sub", "Build is still running — this is the output so far."));
 
@@ -763,6 +874,294 @@ async function openJenkinsJob(url, vpn) {
   } catch (e) { toast("Request failed", "err", String(e)); }
 }
 
+/* ---- Kafka / Mongo cert bundles ---- */
+async function renderCertsView(kind) {
+  const label = kind === "kafka" ? "Kafka" : "Mongo";
+  const main = $("#main");
+  main.innerHTML = "";
+  $("#filter").value = "";
+  $("#filter").placeholder = "Filter " + label + " bundles…  (/ to focus)";
+
+  const head = el("div", "view-head");
+  const back = el("button", "backbtn", "← Clients");
+  back.addEventListener("click", showPicker);
+  head.append(back);
+  head.append(el("h1", "page-title", label));
+  const count = el("span", "count", "cert bundles");
+  head.append(count);
+  const openApp = el("button", "btn-ghost", kind === "kafka" ? "Open Offset Explorer" : "Open Compass");
+  openApp.style.marginLeft = "auto";
+  openApp.addEventListener("click", () => launchApp(kind === "kafka" ? "offsetexplorer" : "compass", null, openApp));
+  head.append(openApp);
+  main.append(head);
+
+  const body = el("div");
+  body.append(el("div", "jk-sub", "Scanning for " + label + " cert bundles…"));
+  main.append(body);
+
+  let data;
+  try { data = await api("/api/certs?kind=" + kind); }
+  catch (e) { body.innerHTML = ""; body.append(el("div", "jk-err", "✗ " + String(e))); return; }
+  body.innerHTML = "";
+  if (!data.ok) { body.append(el("div", "jk-err", "✗ " + (data.error || "failed"))); return; }
+  certApps = data.apps || {};
+  const appInstalled = kind === "kafka" ? certApps.offsetexplorer : certApps.compass;
+  if (!appInstalled) openApp.remove();
+
+  const root = el("div", "certs-root");
+  root.append(document.createTextNode(data.searchHome ? "searching: " : "folder: "));
+  root.append(el("code", null, data.root));
+  root.append(document.createTextNode("  ·  change in Settings → Certs"));
+  body.append(root);
+
+  if (!data.bundles.length) {
+    const e = el("div", "empty");
+    e.textContent = data.exists
+      ? "No " + label + " cert bundles found under " + data.root
+      : "Folder not found: " + data.root + " — set it in Settings → Certs";
+    body.append(e);
+    count.textContent = "0 bundles";
+    return;
+  }
+  count.textContent = data.bundles.length + (data.bundles.length === 1 ? " bundle" : " bundles");
+
+  const byClient = {};
+  for (const b of data.bundles) (byClient[b.client] = byClient[b.client] || []).push(b);
+  for (const client of Object.keys(byClient).sort((a, c) => a.toLowerCase().localeCompare(c.toLowerCase()))) {
+    const sec = el("div", "certs-group");
+    sec.append(el("div", "certs-client", client));
+    const grid = el("div", "certs-grid");
+    for (const b of byClient[client]) grid.append(renderCertBundle(kind, b));
+    sec.append(grid);
+    body.append(sec);
+  }
+}
+
+function renderCertBundle(kind, b) {
+  const card = el("div", "certcard");
+  card.dataset.text = (b.client + " " + b.env + " " + b.name + " " + b.files.join(" ")).toLowerCase();
+  const head = el("div", "certcard-head");
+  head.append(el("div", "certcard-name", b.env === b.client ? b.name : b.env));
+  head.append(el("span", "certcard-files",
+    b.files.length + " file" + (b.files.length === 1 ? "" : "s") + (b.hasDetails ? " · details" : " · no details")));
+  card.append(head);
+
+  const actions = el("div", "certcard-actions");
+  const setup = el("button", "btn-primary", kind === "kafka" ? "Cluster settings" : "Connection");
+  const openBtn = el("button", "btn-ghost", "Open folder");
+  openBtn.addEventListener("click", () => certOpen(kind, b.path, openBtn));
+  actions.append(setup, openBtn);
+  card.append(actions);
+
+  const panel = el("div", "certpanel hidden");
+  card.append(panel);
+  let loaded = false;
+  setup.addEventListener("click", async () => {
+    const hidden = panel.classList.toggle("hidden");
+    setup.textContent = hidden ? (kind === "kafka" ? "Cluster settings" : "Connection") : "Hide";
+    if (!hidden && !loaded) { loaded = true; await loadCertPanel(kind, b, panel); }
+  });
+  return card;
+}
+
+async function loadCertPanel(kind, b, panel) {
+  panel.innerHTML = "";
+  panel.append(el("div", "jk-sub", "Reading connection details…"));
+  let res;
+  try { res = await api("/api/certs/connect?kind=" + kind + "&path=" + encodeURIComponent(b.path)); }
+  catch (e) { panel.innerHTML = ""; panel.append(el("div", "jk-err", "✗ " + String(e))); return; }
+  panel.innerHTML = "";
+  if (!res.ok) { panel.append(el("div", "jk-err", "✗ " + (res.error || "failed"))); return; }
+  if (kind === "kafka") renderKafkaPanel(panel, res, b);
+  else renderMongoPanel(panel, res, b);
+}
+
+// one label / value row with optional Copy and reveal-for-secrets
+function certRow(parent, label, value, opts) {
+  opts = opts || {};
+  const row = el("div", "cert-kv");
+  row.append(el("span", "cert-k", label));
+  const v = el("span", "cert-v" + (opts.mono ? " jk-mono" : ""));
+  const shown = () => (opts.secret && v.dataset.hidden === "1") ? "••••••••" : (value || "—");
+  v.textContent = shown();
+  if (opts.secret) { v.dataset.hidden = "1"; v.textContent = "••••••••"; }
+  row.append(v);
+  if (value && opts.secret) {
+    const r = el("button", "cert-mini", "reveal");
+    r.addEventListener("click", () => {
+      const hide = v.dataset.hidden !== "1";
+      v.dataset.hidden = hide ? "1" : "0";
+      v.textContent = hide ? "••••••••" : value;
+      r.textContent = hide ? "reveal" : "hide";
+    });
+    row.append(r);
+  }
+  if (value && opts.copy !== false) {
+    const c = el("button", "cert-mini", "Copy");
+    c.addEventListener("click", () => copyText(opts.copyValue || value, c));
+    row.append(c);
+  }
+  parent.append(row);
+  return row;
+}
+
+function renderKafkaPanel(panel, res, b) {
+  certRow(panel, "Cluster", res.cluster);
+  certRow(panel, "Bootstrap", res.bootstrap, { mono: true });
+  certRow(panel, "Security", res.security || "SSL", { copy: false });
+  certRow(panel, "Truststore", res.truststore.file, { mono: true, copyValue: res.truststore.path });
+  certRow(panel, "  ↳ password", res.truststore.password, { secret: true });
+  certRow(panel, "Keystore", res.keystore.file, { mono: true, copyValue: res.keystore.path });
+  certRow(panel, "  ↳ password", res.keystore.password, { secret: true });
+
+  const all = [
+    "Cluster name: " + res.cluster,
+    "Bootstrap servers: " + res.bootstrap,
+    "Security: SSL",
+    "Truststore: " + res.truststore.path,
+    "Truststore password: " + res.truststore.password,
+    "Keystore: " + res.keystore.path,
+    "Keystore password: " + res.keystore.password,
+  ].join("\n");
+  const row = el("div", "certcard-actions");
+  if (certApps.offsetexplorerCli) {
+    const add = el("button", "btn-primary", "Save to Offset Explorer");
+    add.addEventListener("click", () => addToOffset(b.path, add));
+    row.append(add);
+  }
+  const copyAll = el("button", certApps.offsetexplorerCli ? "btn-ghost" : "btn-primary", "Copy all");
+  copyAll.addEventListener("click", () => copyText(all, copyAll));
+  row.append(copyAll);
+  if (certApps.offsetexplorer) {
+    const open = el("button", "btn-ghost", "Open Offset Explorer");
+    open.addEventListener("click", () => launchApp("offsetexplorer", null, open));
+    row.append(open);
+  }
+  panel.append(row);
+  panel.append(el("div", "cert-hint", certApps.offsetexplorerCli
+    ? "“Save to Offset Explorer” adds this as an SSL cluster via its command-line tool. "
+      + "If Offset Explorer is open it's closed and reopened automatically (it only loads connections at startup)."
+    : "In Offset Explorer → Add Cluster: paste the Bootstrap servers, set Security to SSL, "
+      + "and point the truststore/keystore at the files above with their passwords."));
+}
+
+function renderMongoPanel(panel, res, b) {
+  certRow(panel, "Name", res.name);
+  certRow(panel, "Host", (res.host || "—") + (res.port ? ":" + res.port : ""), { mono: true });
+  if (res.user) certRow(panel, "User", res.user);
+  if (res.authMech) certRow(panel, "Auth", res.authMech, { copy: false });
+  if (res.databases && res.databases.length) certRow(panel, "Databases", res.databases.join(", "), { copy: false });
+  if (res.ca.file) certRow(panel, "CA file", res.ca.file, { mono: true, copyValue: res.ca.path });
+  if (res.clientPem.file) certRow(panel, "Client PEM", res.clientPem.file, { mono: true, copyValue: res.clientPem.path });
+
+  const uriWrap = el("div", "cert-uri");
+  uriWrap.append(el("div", "cert-k", "Connection string"));
+  const ta = el("textarea", "cert-uri-box");
+  ta.readOnly = true; ta.value = res.uri; ta.rows = 3;
+  uriWrap.append(ta);
+  panel.append(uriWrap);
+
+  const row = el("div", "certcard-actions");
+  if (certApps.compass) {
+    const openc = el("button", "btn-primary", "Open in Compass");
+    openc.addEventListener("click", () => launchApp("compass", b.path, openc));
+    row.append(openc);
+  }
+  const copyUri = el("button", certApps.compass ? "btn-ghost" : "btn-primary", "Copy URI");
+  copyUri.addEventListener("click", () => copyText(res.uri, copyUri));
+  const compass = el("button", "btn-ghost", "Make Compass import file");
+  compass.addEventListener("click", () => makeCompass(b.path, compass));
+  row.append(copyUri, compass);
+  panel.append(row);
+  panel.append(el("div", "cert-hint", certApps.compass
+    ? "“Open in Compass” launches Compass with this connection ready to connect. Or copy the "
+      + "URI into Compass → New Connection."
+    : "Paste the URI into Compass → New Connection. Or make the import file, then in "
+      + "Compass: Connections (sidebar ⋯) → Import connections → pick that file."));
+}
+
+async function certOpen(kind, path, btn) {
+  const label = btn.textContent;
+  btn.disabled = true;
+  try {
+    const res = await api("/api/certs/open", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind, path }),
+    });
+    if (res.ok) toast("Opened folder", "ok");
+    else toast("Could not open", "err", res.error || "");
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+async function addToOffset(path, btn) {
+  const label = btn.textContent;
+  btn.disabled = true;
+  // Closing + reopening OE takes a few seconds, so say so while it runs.
+  btn.textContent = "Saving…";
+  try {
+    const res = await api("/api/certs/kafka-add", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (res.ok) {
+      const name = res.cluster || "";
+      const head = res.duplicate ? "Already in Offset Explorer: " + name
+                                 : "Saved to Offset Explorer: " + name;
+      const sub = res.closed
+        ? (res.reopened ? "closed Offset Explorer, saved, and reopened it — it's in the cluster list"
+                        : "saved — reopen Offset Explorer to see it")
+        : "open Offset Explorer to see it";
+      toast(head, "ok", sub);
+    } else {
+      toast("Not saved", "err", res.error || "Offset Explorer did not store the cluster");
+    }
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+async function launchApp(app, path, btn) {
+  const label = btn.textContent;
+  btn.disabled = true;
+  try {
+    const res = await api("/api/certs/launch", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ app, path }),
+    });
+    if (res.ok) toast("Opening " + (app === "compass" ? "Compass" : "Offset Explorer") + "…", "ok");
+    else toast("Could not open", "err", res.error || "");
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+async function makeCompass(path, btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Writing…";
+  try {
+    const res = await api("/api/certs/compass", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (res.ok) toast("Wrote " + res.file, "ok", "Compass → Import connections → pick this file");
+    else toast("Could not write import file", "err", res.error || "");
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+function copyText(text, btn) {
+  const done = () => { const t = btn.textContent; btn.textContent = "Copied"; setTimeout(() => (btn.textContent = t), 1200); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else { fallbackCopy(text, done); }
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.append(ta); ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) { toast("Copy failed — select and copy manually", "err"); }
+  ta.remove();
+}
+
 /* ---- Settings (credentials + dynamic sources) ---- */
 async function renderSettingsView() {
   const main = $("#main");
@@ -790,6 +1189,7 @@ async function renderSettingsView() {
   body.append(buildThemeSection());
   body.append(buildDisplaySection());
   body.append(buildBrowserSection(data));
+  body.append(buildCertsSection(data));
   body.append(buildSourcesSection(data));
 }
 
@@ -1030,6 +1430,50 @@ function buildSourcesSection(data) {
   return sec;
 }
 
+function buildCertsSection(data) {
+  const s = (data.settings || {});
+  const sec = setSection("Certs (Kafka / Mongo)",
+    "Local folders of downloaded cert bundles the Kafka and Mongo sections scan.");
+
+  const kafka = el("input", "jk-input jk-urlinput"); kafka.value = s.kafka_certs_dir || "";
+  const mongo = el("input", "jk-input jk-urlinput"); mongo.value = s.mongo_certs_dir || "";
+  const searchHome = el("input"); searchHome.type = "checkbox"; searchHome.checked = !!s.certs_search_home;
+  const save = el("button", "btn-primary", "Save cert folders");
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const r = await api("/api/settings", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kafka_certs_dir: kafka.value.trim(), mongo_certs_dir: mongo.value.trim(),
+          certs_search_home: searchHome.checked,
+        }),
+      });
+      if (r.ok) { toast("Cert folders saved", "ok"); renderSettingsView(); }
+      else toast("Save failed", "err", r.error || "");
+    } catch (e) { toast("Save failed", "err", String(e)); }
+    finally { save.disabled = false; }
+  });
+  const form = el("div", "set-form");
+  const searchRow = el("label", "set-radio");
+  searchRow.append(searchHome);
+  const stxt = el("div", "set-radio-txt");
+  stxt.append(el("div", "set-radio-title", "Search my whole home folder"),
+    el("div", "set-radio-desc", "Scan all of ~ for cert bundles instead of only the two folders above (slower)."));
+  searchRow.append(stxt);
+  const hint = el("div", "jk-hint");
+  hint.textContent = "Point these at where you downloaded the Kafka and Mongo cert bundles (e.g. ~/SOFT/kafka, ~/SOFT/mongo).";
+  form.append(labelRow("Kafka certs folder", kafka), labelRow("Mongo certs folder", mongo),
+    searchRow, hint, save);
+
+  editToggle(sec, [
+    ["Kafka certs folder", s.kafka_certs_dir || "—"],
+    ["Mongo certs folder", s.mongo_certs_dir || "—"],
+    ["Search whole home", s.certs_search_home ? "yes" : "no"],
+  ], form);
+  return sec;
+}
+
 function renderEnv(client, env, titleOverride) {
   const card = el("div", "envcard");
   card.dataset.vpn = env.vpn || "";
@@ -1072,6 +1516,8 @@ function syncFromHash() {
   if (want === PROD_KEY) next = PROD_KEY;
   else if (want === REPOS_KEY) next = REPOS_KEY;
   else if (want === JENKINS_KEY) next = JENKINS_KEY;
+  else if (want === KAFKA_KEY) next = KAFKA_KEY;
+  else if (want === MONGO_KEY) next = MONGO_KEY;
   else if (want === SETTINGS_KEY) next = SETTINGS_KEY;
   else if (CONFIG.clients.some(c => c.name === want)) next = want;
   if (next !== selected) { selected = next; $("#filter").value = ""; }

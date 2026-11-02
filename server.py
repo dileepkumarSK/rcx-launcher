@@ -8,11 +8,13 @@ Run:  python3 server.py [--port 8766]
 """
 
 import base64
+import glob
 import http.cookiejar
 import json
 import os
 import re
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -40,6 +42,9 @@ DEFAULT_SETTINGS = {
     "wiki_url": "https://github.com/reactorcx/rcx-devops.wiki.git",
     "jenkins_host_suffix": "devops.lmvi.net",  # only fetch builds from this domain
     "browser": "default",  # "default" = system default browser (xdg-open); "chrome" = logged-in Chrome/Chromium
+    "kafka_certs_dir": "~/SOFT/kafka",   # local folder of downloaded Kafka cert bundles
+    "mongo_certs_dir": "~/SOFT/mongo",   # local folder of downloaded Mongo cert bundles
+    "certs_search_home": False,          # scan the whole home dir instead of the folders above
 }
 
 
@@ -55,11 +60,14 @@ def load_settings():
 
 def save_settings(data):
     cfg = load_settings()
-    for k in ("github_org", "wiki_url", "jenkins_host_suffix"):
+    for k in ("github_org", "wiki_url", "jenkins_host_suffix",
+              "kafka_certs_dir", "mongo_certs_dir"):
         if data.get(k):
             cfg[k] = str(data[k]).strip()
     if data.get("browser") in ("chrome", "default"):
         cfg["browser"] = data["browser"]
+    if "certs_search_home" in data:
+        cfg["certs_search_home"] = bool(data["certs_search_home"])
     with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     return cfg
@@ -329,9 +337,172 @@ def resolve_build_url(target, build):
     return t + "/lastBuild"
 
 
+def _first_cause(info):
+    """Human 'who/what started this build' from the build's actions, or ''."""
+    for a in info.get("actions", []) or []:
+        for c in (a.get("causes") or []):
+            if c.get("shortDescription"):
+                return c["shortDescription"]
+    return ""
+
+
+def _build_params(info):
+    """Build parameters as [{name, value}] (from the ParametersAction)."""
+    out = []
+    for a in info.get("actions", []) or []:
+        for p in (a.get("parameters") or []):
+            name = p.get("name")
+            if name is None:
+                continue
+            val = p.get("value")
+            if isinstance(val, bool):
+                val = "true" if val else "false"
+            out.append({"name": name, "value": "" if val is None else str(val)})
+    return out
+
+
+def _build_scm(info):
+    """Git branch + short commit for the build, if the git plugin recorded it."""
+    for a in info.get("actions", []) or []:
+        rev = a.get("lastBuiltRevision")
+        if rev:
+            sha = rev.get("SHA1") or ""
+            branches = rev.get("branch") or []
+            branch = branches[0].get("name") if branches else ""
+            return {"commit": sha[:10] if sha else "", "branch": branch or ""}
+    return {}
+
+
+# Parameter names (lowercased) that commonly carry the release/image version.
+_VERSION_KEYS = ("version", "release_version", "build_version", "app_version",
+                 "image_tag", "docker_tag", "tag", "release", "artifact_version")
+
+
+def _derive_version(params, description):
+    """Best-effort build version: a version-ish parameter, else a version in the
+    build description (teams often set it there), else ''."""
+    pm = {p["name"].lower(): p["value"] for p in params}
+    for k in _VERSION_KEYS:
+        if pm.get(k):
+            return pm[k]
+    for p in params:
+        nl = p["name"].lower()
+        if ("version" in nl or "tag" in nl) and p["value"]:
+            return p["value"]
+    if description:
+        m = re.search(r"\bv?\d+\.\d+[\w.\-+]*", description)
+        if m:
+            return m.group(0)
+    return ""
+
+
+def _version_from_log(log):
+    """Scan the console for a published artifact/image version. Teams publish to
+    Nexus or AWS ECR at the end of a build, and the version/tag shows up there.
+    Returns (version, source) or ('', '')."""
+    if not log:
+        return "", ""
+    patterns = [
+        # AWS ECR push: the tag is printed as "1.4.2: digest: sha256:..."
+        (r"(?m)^(v?\d[\w.\-]*): digest: sha256:", "ECR image"),
+        # AWS ECR image ref: 1234.dkr.ecr.us-east-1.amazonaws.com/repo:TAG
+        (r"\.dkr\.ecr\.[\w-]+\.amazonaws\.com/[\w./-]+:(v?\d[\w.\-]*)", "ECR image"),
+        (r"(?:docker push|Pushing|Pushed|tagging|tagged)\s+[\w./-]+:(v?\d[\w.\-]*)", "image tag"),
+        # Nexus / Maven artifact upload: .../artifact-1.2.3.jar, Uploaded .../1.2.3/...
+        (r"[Uu]pload(?:ed|ing)?\b[^\n]*?/(\d[\w.\-]*)/[\w.\-]+\.(?:jar|war|zip|tgz|pom)", "Nexus artifact"),
+        (r"(?:nexus|repository)[^\n]*?(\d+\.\d+\.\d[\w.\-]*)", "Nexus"),
+        (r"Building (?:jar|war):[^\n]*?-(\d+\.\d+[\w.\-]*)\.(?:jar|war)", "artifact"),
+        (r"(?:^|\s)(?:version|VERSION|releaseVersion)\s*[=:]\s*v?(\d+\.\d+[\w.\-]*)", "log"),
+    ]
+    for rx, src in patterns:
+        m = re.search(rx, log, re.MULTILINE)
+        if m:
+            return m.group(1), src
+    return "", ""
+
+
+def _image_from_log(log):
+    """The published container image ref (repo:tag) from the log, repo shortened to
+    its last path segment: 'host/ns/rcx-api-gateway:TAG' -> 'rcx-api-gateway:TAG'.
+    The tag may carry an arch/branch prefix (arm64-feature-...-2.0.0-8), so it is
+    NOT required to start with a digit -- only to contain one (skips :latest)."""
+    if not log:
+        return ""
+    tag = r"[A-Za-z0-9][\w.\-]*\d[\w.\-]*"          # a tag that contains a digit
+    rx_ref = re.compile(r"(?:Successfully tagged|docker\s+push|docker\s+tag[^\n]*?\s)\s*"
+                        r"([A-Za-z0-9][\w./\-]*:" + tag + r")\b", re.I)
+    rx_ecr = re.compile(r"([\w.\-]*\.amazonaws\.com/[\w./\-]+:" + tag + r")\b")
+    rx_digest = re.compile(r"^(" + tag + r"): digest: sha256:")
+    rx_repo = re.compile(r"repository\s*\[([^\]]+)\]")
+
+    def short(ref):
+        repo, _, t = ref.rpartition(":")
+        return repo.rstrip("/").split("/")[-1] + ":" + t
+
+    lines = log.splitlines()
+    for line in lines:
+        m = rx_ref.search(line) or rx_ecr.search(line)
+        if m:
+            return short(m.group(1))
+    last_repo = ""
+    for line in lines:
+        rm = rx_repo.search(line)
+        if rm:
+            last_repo = rm.group(1).rstrip("/").split("/")[-1]
+        dm = rx_digest.search(line.strip())
+        if dm:
+            return (last_repo + ":" + dm.group(1)) if last_repo else dm.group(1)
+    return ""
+
+
+def _build_extras(info, log=None):
+    """The 'full build info' extras: parameters, git commit/branch, description, the
+    published image ref, and the release version (from a parameter, the description,
+    the image tag, or the log)."""
+    params = _build_params(info)
+    desc = info.get("description")
+    version = _derive_version(params, desc)
+    source = "parameter" if version else ""
+    image = _image_from_log(log)
+    if not version and image:
+        tag = image.split(":", 1)[1]
+        m = re.search(r"\d+\.\d+[\w.\-]*", tag)      # pull a clean version out of the tag
+        version, source = (m.group(0) if m else tag), "image"
+    if not version:
+        version, source = _version_from_log(log)
+    return {
+        "params": params,
+        "scm": _build_scm(info),
+        "description": desc,
+        "image": image,
+        "version": version,
+        "versionSource": source,
+    }
+
+
+def jenkins_job_tail(cfg, build_url):
+    """Last-successful / last build of the job that owns build_url (for context)."""
+    m = re.search(r"^(.*?)/(\d+)/?$", build_url.rstrip("/"))
+    job_url = (m.group(1) + "/") if m else (build_url.rstrip("/") + "/")
+    try:
+        data = jenkins_api(
+            cfg, job_url,
+            "lastSuccessfulBuild[number,timestamp,duration,url],"
+            "lastBuild[number,timestamp,duration,url,result,building]")
+    except Exception:
+        return {}
+    return {"url": job_url,
+            "lastSuccess": data.get("lastSuccessfulBuild"),
+            "lastBuild": data.get("lastBuild")}
+
+
 def jenkins_diagnose(cfg, build_url):
-    info = jenkins_api(cfg, build_url,
-                       "number,result,building,fullDisplayName,url,timestamp,duration")
+    info = jenkins_api(
+        cfg, build_url,
+        "number,result,building,fullDisplayName,displayName,description,url,timestamp,"
+        "duration,estimatedDuration,"
+        "actions[causes[shortDescription],parameters[name,value],"
+        "lastBuiltRevision[SHA1,branch[name]]]")
     stages = []
     try:
         wf = json.loads(jenkins_text(cfg, build_url.rstrip("/") + "/wfapi/describe"))
@@ -352,10 +523,16 @@ def jenkins_diagnose(cfg, build_url):
         "name": info.get("fullDisplayName"),
         "number": info.get("number"),
         "url": info.get("url") or build_url,
+        "timestamp": info.get("timestamp"),
+        "duration": info.get("duration"),
+        "estimatedDuration": info.get("estimatedDuration"),
+        "cause": _first_cause(info),
+        "job": jenkins_job_tail(cfg, build_url),
         "stages": stages,
         "failedStages": failed,
         "reason": extract_failure(log),
         "log": log,
+        **_build_extras(info, log),
     }
 
 
@@ -428,8 +605,12 @@ def jenkins_build_status(cfg, queue_url=None, build_url=None):
     if not build_url:
         return {"ok": False, "error": "no queue item or build url"}
 
-    info = jenkins_api(cfg, build_url,
-                       "number,result,building,fullDisplayName,url")
+    info = jenkins_api(
+        cfg, build_url,
+        "number,result,building,fullDisplayName,displayName,description,url,timestamp,"
+        "duration,estimatedDuration,"
+        "actions[causes[shortDescription],parameters[name,value],"
+        "lastBuiltRevision[SHA1,branch[name]]]")
     building = info.get("building")
     out = {
         "ok": True,
@@ -440,6 +621,11 @@ def jenkins_build_status(cfg, queue_url=None, build_url=None):
         "name": info.get("fullDisplayName"),
         "url": info.get("url") or build_url,
         "buildUrl": build_url,
+        "timestamp": info.get("timestamp"),
+        "duration": info.get("duration"),
+        "estimatedDuration": info.get("estimatedDuration"),
+        "cause": _first_cause(info),
+        "job": jenkins_job_tail(cfg, build_url),
     }
     if building:
         try:
@@ -450,6 +636,7 @@ def jenkins_build_status(cfg, queue_url=None, build_url=None):
         diag = jenkins_diagnose(cfg, build_url)
         out.update({"stages": diag["stages"], "failedStages": diag["failedStages"],
                     "reason": diag["reason"], "log": diag["log"]})
+    out.update(_build_extras(info, out.get("log")))
     return out
 
 
@@ -542,6 +729,291 @@ def open_url(url):
     return False, "no browser available (install a browser, or xdg-open)"
 
 
+# ---------------------------------------------------------------------------
+# Kafka / Mongo cert bundles: scan a local folder of downloaded cert bundles and
+# turn each into copy-ready connection settings. Secrets (keystore passwords, DB
+# passwords) live only in the user's local files; they're read on demand and sent
+# to the localhost UI, never stored in config or committed.
+# ---------------------------------------------------------------------------
+
+_CERT_EXTS = {"kafka": (".jks",),
+              "mongo": (".pem", ".crt", ".key", ".p12", ".jks")}
+
+
+def _certs_root(kind):
+    s = load_settings()
+    key = "kafka_certs_dir" if kind == "kafka" else "mongo_certs_dir"
+    default = DEFAULT_SETTINGS[key]
+    return os.path.realpath(os.path.expanduser(s.get(key) or default))
+
+
+def _certs_roots(kind):
+    """Directories we're allowed to scan/read for this kind."""
+    if load_settings().get("certs_search_home"):
+        return [os.path.realpath(os.path.expanduser("~"))]
+    return [_certs_root(kind)]
+
+
+def _cert_path_ok(kind, path):
+    """True if `path` sits inside an allowed cert root (guards open/read/write)."""
+    rp = os.path.realpath(path)
+    for a in _certs_roots(kind):
+        if rp == a or rp.startswith(a + os.sep):
+            return True
+    return False
+
+
+def _is_details(fn):
+    l = fn.lower()
+    return l.endswith(".txt") and ("connection" in l or "detail" in l)
+
+
+def _client_env(dirpath, root):
+    rel = os.path.relpath(dirpath, root)
+    parts = [p.strip() for p in rel.split(os.sep) if p and p != "."]
+    if not parts:
+        parts = [os.path.basename(dirpath)]
+    client = parts[0]
+    env = " / ".join(parts[1:]) if len(parts) > 1 else parts[0]
+    return client, env
+
+
+def scan_cert_bundles(kind):
+    """Each directory that holds a relevant cert file is one bundle (metadata only)."""
+    exts = _CERT_EXTS[kind]
+    out = {}
+    for root in _certs_roots(kind):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            certs = sorted(f for f in files if f.lower().endswith(exts))
+            if not certs:
+                continue
+            client, env = _client_env(dirpath, root)
+            out[dirpath] = {
+                "kind": kind, "path": dirpath, "client": client, "env": env,
+                "name": os.path.basename(dirpath) or client,
+                "files": certs,
+                "hasDetails": any(_is_details(f) for f in files),
+            }
+    return sorted(out.values(), key=lambda b: (b["client"].lower(), b["env"].lower()))
+
+
+def _read_details(path):
+    try:
+        f = next((x for x in os.listdir(path) if _is_details(x)), None)
+    except OSError:
+        return ""
+    if not f:
+        return ""
+    try:
+        with open(os.path.join(path, f), encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def _grab(txt, pat):
+    m = re.search(r"(?im)(?:" + pat + r")\s*[:=]\s*(\S+)", txt)
+    return m.group(1).strip() if m else ""
+
+
+def _pick(files, *needles, ext=None):
+    for f in files:
+        l = f.lower()
+        if ext and not l.endswith(ext):
+            continue
+        if all(n in l for n in needles):
+            return f
+    return ""
+
+
+def kafka_connect(path):
+    files = os.listdir(path)
+    txt = _read_details(path)
+    truststore = _pick(files, "truststore", ext=".jks")
+    keystore = (_pick(files, "keystore", ext=".jks")
+                or _pick(files, "clientstore", ext=".jks"))
+    return {
+        "kind": "kafka",
+        "cluster": _grab(txt, r"cluster\s*name") or os.path.basename(path),
+        "bootstrap": _grab(txt, r"bootstrap"),
+        "zookeeper": _grab(txt, r"zookeeper\s*host"),
+        "security": "SSL",
+        "truststore": {"file": truststore,
+                       "path": os.path.join(path, truststore) if truststore else "",
+                       "password": _grab(txt, r"truststore\s*password")},
+        "keystore": {"file": keystore,
+                     "path": os.path.join(path, keystore) if keystore else "",
+                     "password": _grab(txt, r"keystore\s*password")},
+    }
+
+
+def mongo_connect(path):
+    import urllib.parse as up
+    files = os.listdir(path)
+    txt = _read_details(path)
+    ca = _pick(files, "ca", ext=".pem") or _pick(files, "ca", ext=".crt")
+    client_pem = (_pick(files, "client", ext=".pem")
+                  or next((f for f in files if f.lower().endswith(".pem") and f != ca), ""))
+    host = _grab(txt, r"address|host")
+    port = _grab(txt, r"port") or "27017"
+    user = _grab(txt, r"user\s*name|username|user")
+    pw = _grab(txt, r"password")
+    mech = _grab(txt, r"auth\s*mech\w*") or "SCRAM-SHA-1"
+    passphrase = _grab(txt, r"passphrase")
+    dbs = re.findall(r"(?im)^\s*database\s*[:=]\s*(\S+)", txt)
+    ca_path = os.path.join(path, ca) if ca else ""
+    pem_path = os.path.join(path, client_pem) if client_pem else ""
+    cred = (up.quote(user, safe="") + ":" + up.quote(pw, safe="") + "@") if user else ""
+    params = ["tls=true", "directConnection=true"]
+    if ca_path:
+        params.append("tlsCAFile=" + up.quote(ca_path, safe="/"))
+    if pem_path:
+        params.append("tlsCertificateKeyFile=" + up.quote(pem_path, safe="/"))
+    if passphrase:
+        params.append("tlsCertificateKeyFilePassword=" + up.quote(passphrase, safe=""))
+    if mech:
+        params.append("authMechanism=" + up.quote(mech, safe=""))
+    hostport = (host or "localhost") + ":" + port
+    uri = "mongodb://" + cred + hostport + "/?" + "&".join(params)
+    return {
+        "kind": "mongo",
+        "name": _grab(txt, r"name") or os.path.basename(path),
+        "host": host, "port": port, "user": user,
+        "authMech": mech, "databases": sorted(set(dbs)),
+        "ca": {"file": ca, "path": ca_path},
+        "clientPem": {"file": client_pem, "path": pem_path},
+        "uri": uri,
+    }
+
+
+def write_compass_import(path):
+    """Write a Compass 'Import Connections' JSON for a mongo bundle; return its path.
+    The file carries the connection string (with credentials), so it's chmod 600."""
+    import uuid
+    info = mongo_connect(path)
+    doc = {
+        "type": "Compass Connections",
+        "version": 1,
+        "connections": [{
+            "id": str(uuid.uuid4()),
+            "favorite": {"name": info["name"]},
+            "connectionOptions": {"connectionString": info["uri"]},
+        }],
+    }
+    out = os.path.join(path, "compass-connection.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+    try:
+        os.chmod(out, 0o600)
+    except OSError:
+        pass
+    return out
+
+
+# ---- launching the desktop clients ----
+
+def _first_exe(*cands):
+    for c in cands:
+        if not c:
+            continue
+        c = os.path.expanduser(c)
+        matches = sorted(glob.glob(c)) if "*" in c else [c]
+        for m in matches:
+            if os.path.isfile(m) and os.access(m, os.X_OK):
+                return m
+    return ""
+
+
+def offsetexplorer_gui():
+    return _first_exe(shutil.which("offset-explorer") or "",
+                      shutil.which("offsetexplorer") or "",
+                      "~/offsetexplorer*/offsetexplorer",
+                      "/opt/offsetexplorer*/offsetexplorer")
+
+
+def offsetexplorer_cli():
+    return _first_exe("~/offsetexplorer*/commandline",
+                      "/opt/offsetexplorer*/commandline")
+
+
+def compass_bin():
+    return (shutil.which("mongodb-compass") or shutil.which("mongodb-compass-stable")
+            or shutil.which("mongodb-compass-beta") or "")
+
+
+def offsetexplorer_running():
+    """True if the Offset Explorer GUI is open (it reloads connections only at
+    startup, so a save made while it's running shows up after a restart)."""
+    try:
+        r = subprocess.run(["pgrep", "-f", "MainApp_offsetexplorer"],
+                           capture_output=True, text=True, timeout=5)
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def _offsetexplorer_pids():
+    try:
+        r = subprocess.run(["pgrep", "-f", "MainApp_offsetexplorer"],
+                           capture_output=True, text=True, timeout=5)
+        return [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def stop_offsetexplorer(timeout=20):
+    """Close the running Offset Explorer GUI and wait for it to exit, so the
+    connections it holds in memory are flushed to connections.xml before we add
+    to that file (OE rewrites the file on close, so a save made while it's open
+    would otherwise be lost). SIGTERM first for a clean shutdown, SIGKILL only
+    if it refuses to go. Returns True once no OE process remains."""
+    pids = _offsetexplorer_pids()
+    if not pids:
+        return True
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not offsetexplorer_running():
+            time.sleep(0.5)          # let the file write settle
+            return True
+        time.sleep(0.4)
+    for pid in _offsetexplorer_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.6)
+    return not offsetexplorer_running()
+
+
+def cluster_in_connections(cluster):
+    """True if a connection with this name is present in Offset Explorer's saved
+    file. Reads only the file's connection names, never the stored secrets."""
+    conn = os.path.expanduser("~/.offsetexplorer4/connections.xml")
+    try:
+        with open(conn, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.read()
+    except OSError:
+        return False
+    names = set(re.findall(r'name="([^"]*)"', data))
+    return cluster in names
+
+
+def certs_apps():
+    return {
+        "offsetexplorer": bool(offsetexplorer_gui()),
+        "offsetexplorerCli": bool(offsetexplorer_cli()),
+        "compass": bool(compass_bin()),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RCXLauncher/1.0"
 
@@ -615,8 +1087,38 @@ class Handler(BaseHTTPRequestHandler):
                 "jenkins": {"configured": jenkins_configured(jk),
                             "base": jk["base"], "user": jk["user"], "vpn": jk["vpn"]},
             })
+        elif path == "/api/certs":
+            self._handle_certs_list()
+        elif path == "/api/certs/connect":
+            self._handle_certs_connect()
         else:
             self._serve_static(path)
+
+    def _handle_certs_list(self):
+        q = parse_qs(urlparse(self.path).query)
+        kind = q.get("kind", [""])[0]
+        if kind not in ("kafka", "mongo"):
+            self._send_json({"ok": False, "error": "kind must be kafka or mongo"}, 400)
+            return
+        root = _certs_root(kind)
+        self._send_json({"ok": True, "kind": kind, "root": root,
+                         "searchHome": bool(load_settings().get("certs_search_home")),
+                         "exists": os.path.isdir(root),
+                         "apps": certs_apps(),
+                         "bundles": scan_cert_bundles(kind)})
+
+    def _handle_certs_connect(self):
+        q = parse_qs(urlparse(self.path).query)
+        kind = q.get("kind", [""])[0]
+        path = q.get("path", [""])[0]
+        if kind not in ("kafka", "mongo"):
+            self._send_json({"ok": False, "error": "bad kind"}, 400)
+            return
+        if not path or not _cert_path_ok(kind, path) or not os.path.isdir(path):
+            self._send_json({"ok": False, "error": "unknown cert folder"}, 400)
+            return
+        info = kafka_connect(path) if kind == "kafka" else mongo_connect(path)
+        self._send_json({"ok": True, **info})
 
     def _handle_jenkins_jobs(self):
         cfg = load_jenkins()
@@ -681,8 +1183,144 @@ class Handler(BaseHTTPRequestHandler):
                 return
             g = save_github(data)
             self._send_json({"ok": True, "configured": bool(g["token"]), "user": g["user"]})
+        elif path == "/api/certs/open":
+            self._handle_certs_open()
+        elif path == "/api/certs/compass":
+            self._handle_certs_compass()
+        elif path == "/api/certs/launch":
+            self._handle_certs_launch()
+        elif path == "/api/certs/kafka-add":
+            self._handle_kafka_add()
         else:
             self.send_error(404, "Not found")
+
+    def _handle_certs_launch(self):
+        data = self._read_json()
+        app = data.get("app")
+        if app == "offsetexplorer":
+            exe = offsetexplorer_gui()
+            if not exe:
+                self._send_json({"ok": False, "error": "Offset Explorer not found"}, 404)
+                return
+            ok, msg = _spawn([exe])
+            self._send_json({"ok": ok, "error": None if ok else msg})
+            return
+        if app == "compass":
+            exe = compass_bin()
+            if not exe:
+                self._send_json({"ok": False, "error": "MongoDB Compass not found"}, 404)
+                return
+            argv = [exe]
+            path = (data.get("path") or "").strip()
+            if path and _cert_path_ok("mongo", path) and os.path.isdir(path):
+                argv.append(mongo_connect(path)["uri"])
+            ok, msg = _spawn(argv)
+            self._send_json({"ok": ok, "error": None if ok else msg})
+            return
+        self._send_json({"ok": False, "error": "unknown app"}, 400)
+
+    def _handle_kafka_add(self):
+        data = self._read_json()
+        path = (data.get("path") or "").strip()
+        if not path or not _cert_path_ok("kafka", path) or not os.path.isdir(path):
+            self._send_json({"ok": False, "error": "unknown cert folder"}, 400)
+            return
+        cli = offsetexplorer_cli()
+        if not cli:
+            self._send_json({"ok": False,
+                             "error": "Offset Explorer command-line tool not found"}, 404)
+            return
+        info = kafka_connect(path)
+        if not info["bootstrap"]:
+            self._send_json({"ok": False,
+                             "error": "no bootstrap server in the connection details"}, 400)
+            return
+        # The official CLI adds + saves the cluster into Offset Explorer (it handles
+        # its own password storage), so we don't touch connections.xml. Args are a
+        # list (no shell), so passwords never hit a shell history.
+        args = [cli, "-addServerConnection", "-name", info["cluster"],
+                "-bootstrapServers", info["bootstrap"], "-security", "ssl",
+                "-testConnection", "false"]
+        ts, ks = info["truststore"], info["keystore"]
+        if ts["path"]:
+            args += ["-truststoreLocation", ts["path"]]
+            if ts["password"]:
+                args += ["-truststorePassword", ts["password"]]
+        if ks["path"]:
+            args += ["-keystoreLocation", ks["path"]]
+            if ks["password"]:
+                args += ["-keystorePassword", ks["password"],
+                         "-keystorePrivateKey", ks["password"]]
+        # Offset Explorer rewrites connections.xml when it closes, so a save made
+        # while it's open is wiped. If it's running, close it (flushing its own
+        # connections to disk first), add via the CLI, then relaunch it so the new
+        # cluster is loaded. The CLI exits 0 even on failure and prints the reason
+        # to stdout, so success is judged by whether the cluster actually landed in
+        # the saved file (we read only connection names there, never the secrets).
+        cluster = info["cluster"]
+        was_running = offsetexplorer_running()
+        closed = stop_offsetexplorer() if was_running else False
+        if was_running and not closed:
+            self._send_json({
+                "ok": False, "cluster": cluster, "duplicate": False,
+                "wasRunning": True, "closed": False, "reopened": False,
+                "error": "could not close Offset Explorer to save; close it manually and try again",
+            })
+            return
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=120)
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+        except Exception as exc:
+            out = ""
+            r = None
+            err = str(exc)
+        else:
+            err = None
+        low = out.lower()
+        dup = "already exist" in low
+        # The authoritative check: is the cluster now in the saved connections file?
+        saved = cluster_in_connections(cluster)
+        ok = err is None and (saved or dup)
+        reopened = False
+        if closed:                       # put OE back exactly as we found it
+            rok, _ = _spawn([offsetexplorer_gui()])
+            reopened = rok
+        self._send_json({
+            "ok": ok, "cluster": cluster, "duplicate": dup,
+            "wasRunning": was_running, "closed": closed, "reopened": reopened,
+            "output": out[-500:],
+            "error": None if ok else (err or out[-300:]
+                                      or "cluster was not written to Offset Explorer"),
+        })
+
+    def _handle_certs_open(self):
+        data = self._read_json()
+        kind = data.get("kind")
+        path = (data.get("path") or "").strip()
+        if kind not in ("kafka", "mongo") or not path or not _cert_path_ok(kind, path):
+            self._send_json({"ok": False, "error": "unknown cert folder"}, 400)
+            return
+        if not os.path.isdir(path):
+            self._send_json({"ok": False, "error": "folder not found"}, 404)
+            return
+        if not shutil.which("xdg-open"):
+            self._send_json({"ok": False, "error": "xdg-open not available"}, 500)
+            return
+        ok, msg = _spawn(["xdg-open", path])
+        self._send_json({"ok": ok, "error": None if ok else msg})
+
+    def _handle_certs_compass(self):
+        data = self._read_json()
+        path = (data.get("path") or "").strip()
+        if not path or not _cert_path_ok("mongo", path) or not os.path.isdir(path):
+            self._send_json({"ok": False, "error": "unknown cert folder"}, 400)
+            return
+        try:
+            out = write_compass_import(path)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        self._send_json({"ok": True, "file": out})
 
     def _handle_jenkins_auth(self):
         data = self._read_json()
