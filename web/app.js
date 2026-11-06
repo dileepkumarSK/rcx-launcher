@@ -521,8 +521,9 @@ function buildJkPanel(panel, cfg) {
     openJenkinsJob(url, cfg.vpn);
   });
 
-  const refresh = el("button", "jk-link", "↻ refresh repos");
-  refresh.addEventListener("click", () => loadJkRepos(repoInput, repoDL, true));
+  const refresh = el("button", "btn-ghost", "↻ Refresh repos");
+  refresh.title = "Re-scan Jenkins for new repos — clears the cached list and pulls the current one (~20s)";
+  refresh.addEventListener("click", () => loadJkRepos(repoInput, repoDL, true, refresh));
 
   repoInput.addEventListener("change", () => {
     const url = jkRepoMap && jkRepoMap[repoInput.value];
@@ -564,11 +565,13 @@ function buildJkPanel(panel, cfg) {
   loadJkRepos(repoInput, repoDL, false);
 }
 
-async function loadJkRepos(repoInput, repoDL, refresh) {
-  repoInput.placeholder = refresh ? "refreshing repos…" : "loading repos…";
+async function loadJkRepos(repoInput, repoDL, refresh, btn) {
+  repoInput.placeholder = refresh ? "refreshing repos (~20s)…" : "loading repos…";
+  if (btn) { btn.disabled = true; btn.dataset.lbl = btn.textContent; btn.textContent = "Refreshing…"; }
   try {
     const r = await api("/api/jenkins/jobs" + (refresh ? "?refresh=1" : ""));
-    if (!r.ok) { toast("Could not load repos", "err", r.error || ""); return; }
+    if (!r.ok) { toast("Could not load repos", "err", r.error || ""); repoInput.placeholder = "failed to load repos"; return; }
+    const prev = jkRepoMap ? Object.keys(jkRepoMap).length : 0;
     jkRepoMap = {};
     repoDL.innerHTML = "";
     for (const repo of r.repos) {
@@ -577,10 +580,16 @@ async function loadJkRepos(repoInput, repoDL, refresh) {
       const o = el("option"); o.value = label; repoDL.append(o);
     }
     repoInput.placeholder = "type a repo… (" + r.repos.length + ")";
-    if (refresh) toast("Repo list refreshed (" + r.repos.length + ")", "ok");
+    if (refresh) {
+      const added = r.repos.length - prev;
+      toast("Repo list refreshed (" + r.repos.length + ")", "ok",
+        added > 0 ? added + " new since last fetch — now selectable" : "new repos are now selectable");
+    }
   } catch (e) {
     toast("Could not load repos", "err", String(e));
     repoInput.placeholder = "failed to load repos";
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.lbl || "↻ Refresh repos"; }
   }
 }
 
@@ -1439,21 +1448,65 @@ function buildCertsSection(data) {
   const mongo = el("input", "jk-input jk-urlinput"); mongo.value = s.mongo_certs_dir || "";
   const searchHome = el("input"); searchHome.type = "checkbox"; searchHome.checked = !!s.certs_search_home;
   const save = el("button", "btn-primary", "Save cert folders");
-  save.addEventListener("click", async () => {
+
+  // Shared save: used by the Save button and after a folder is picked.
+  async function doSave() {
     save.disabled = true;
     try {
+      const kv = kafka.value.trim(), mv = mongo.value.trim();
       const r = await api("/api/settings", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          kafka_certs_dir: kafka.value.trim(), mongo_certs_dir: mongo.value.trim(),
+          kafka_certs_dir: kv, mongo_certs_dir: mv,
           certs_search_home: searchHome.checked,
         }),
       });
-      if (r.ok) { toast("Cert folders saved", "ok"); renderSettingsView(); }
-      else toast("Save failed", "err", r.error || "");
-    } catch (e) { toast("Save failed", "err", String(e)); }
+      if (!r.ok) { toast("Save failed", "err", r.error || ""); return false; }
+      // Confirm the server actually stored what we sent. An older server.py
+      // answers ok:true but doesn't know the cert-folder keys, so the value
+      // silently reverts — catch that and say what to do instead of "saved".
+      const st = r.settings || {};
+      const stored = (!kv || st.kafka_certs_dir === kv) && (!mv || st.mongo_certs_dir === mv)
+        && st.certs_search_home === searchHome.checked;
+      if (!stored) {
+        toast("Server didn't store the setting", "err",
+          "your launcher is running an older version — fully restart it (stop the server and relaunch), then try again");
+        return false;
+      }
+      toast("Cert folders saved", "ok");
+      renderSettingsView();
+      return true;
+    } catch (e) { toast("Save failed", "err", String(e)); return false; }
     finally { save.disabled = false; }
-  });
+  }
+  save.addEventListener("click", doSave);
+
+  // Native folder picker (server-side zenity/kdialog) → fill the field + save.
+  async function chooseFolder(inputEl, title, btn) {
+    const t = btn.textContent; btn.disabled = true; btn.textContent = "Opening…";
+    try {
+      const r = await api("/api/pick-folder", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      if (r.ok && r.path) { inputEl.value = r.path; await doSave(); }
+      else if (r.unavailable) toast("No folder picker", "err", r.error || "");
+      // cancelled → do nothing
+    } catch (e) { toast("Picker failed", "err", String(e)); }
+    finally { btn.disabled = false; btn.textContent = t; }
+  }
+  function folderRow(labelText, inputEl, title) {
+    const row = el("label", "jk-row");
+    row.append(el("span", "jk-label", labelText));
+    const line = el("div", "cert-inline");
+    const pick = el("button", "btn-ghost cert-choose", "Choose…");
+    pick.type = "button";
+    pick.addEventListener("click", () => chooseFolder(inputEl, title, pick));
+    line.append(inputEl, pick);
+    row.append(line);
+    return row;
+  }
+
   const form = el("div", "set-form");
   const searchRow = el("label", "set-radio");
   searchRow.append(searchHome);
@@ -1462,8 +1515,9 @@ function buildCertsSection(data) {
     el("div", "set-radio-desc", "Scan all of ~ for cert bundles instead of only the two folders above (slower)."));
   searchRow.append(stxt);
   const hint = el("div", "jk-hint");
-  hint.textContent = "Point these at where you downloaded the Kafka and Mongo cert bundles (e.g. ~/SOFT/kafka, ~/SOFT/mongo).";
-  form.append(labelRow("Kafka certs folder", kafka), labelRow("Mongo certs folder", mongo),
+  hint.textContent = "Pick where you downloaded the Kafka and Mongo cert bundles (e.g. ~/SOFT/kafka, ~/SOFT/mongo) — use Choose… or type the path.";
+  form.append(folderRow("Kafka certs folder", kafka, "Choose Kafka certs folder"),
+    folderRow("Mongo certs folder", mongo, "Choose Mongo certs folder"),
     searchRow, hint, save);
 
   editToggle(sec, [

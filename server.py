@@ -236,28 +236,38 @@ _FOLDER = ("Folder", "OrganizationFolder")
 
 
 def jenkins_crawl_repos(cfg):
-    """Walk the folder tree, collecting multibranch projects (= repos)."""
+    """Walk the folder tree, collecting multibranch projects (= repos). Each folder
+    level is listed in parallel, so a full refresh is seconds rather than minutes
+    over the VPN (one sequential call per folder used to take ~1–2 min)."""
+    from concurrent.futures import ThreadPoolExecutor
+
     repos = []
 
-    def walk(url, path, depth):
-        if depth > 5:
-            return
+    def children(url):
         try:
-            data = jenkins_api(cfg, url, "jobs[name,url,_class]")
+            return jenkins_api(cfg, url, "jobs[name,url,_class]").get("jobs", [])
         except Exception:
-            return
-        for j in data.get("jobs", []):
-            cls = j.get("_class", "").split(".")[-1]
-            name, jurl = j.get("name"), j.get("url")
-            if any(m in cls for m in _MULTI):
-                repos.append({"repo": name, "folder": "/".join(path), "url": jurl})
-            elif any(f in cls for f in _FOLDER):
-                walk(jurl, path + [name], depth + 1)
-            elif "WorkflowJob" in cls or "FreeStyle" in cls:
-                repos.append({"repo": name, "folder": "/".join(path),
-                              "url": jurl, "standalone": True})
+            return []
 
-    walk(cfg["base"], [], 0)
+    frontier = [(cfg["base"], [])]            # (folder url, path-so-far)
+    depth = 0
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        while frontier and depth <= 6:
+            fetched = list(ex.map(lambda it: (it[1], children(it[0])), frontier))
+            nxt = []
+            for path, jobs in fetched:
+                for j in jobs:
+                    cls = j.get("_class", "").split(".")[-1]
+                    name, jurl = j.get("name"), j.get("url")
+                    if any(m in cls for m in _MULTI):
+                        repos.append({"repo": name, "folder": "/".join(path), "url": jurl})
+                    elif any(f in cls for f in _FOLDER):
+                        nxt.append((jurl, path + [name]))
+                    elif "WorkflowJob" in cls or "FreeStyle" in cls:
+                        repos.append({"repo": name, "folder": "/".join(path),
+                                      "url": jurl, "standalone": True})
+            frontier = nxt
+            depth += 1
     repos.sort(key=lambda r: (r["folder"].lower(), r["repo"].lower()))
     return repos
 
@@ -931,12 +941,18 @@ def offsetexplorer_gui():
     return _first_exe(shutil.which("offset-explorer") or "",
                       shutil.which("offsetexplorer") or "",
                       "~/offsetexplorer*/offsetexplorer",
-                      "/opt/offsetexplorer*/offsetexplorer")
+                      "~/offset-explorer*/offset-explorer",
+                      "/opt/offsetexplorer*/offsetexplorer",
+                      "/opt/offset-explorer*/offset-explorer",
+                      "/snap/offset-explorer/current/offsetexplorer")
 
 
 def offsetexplorer_cli():
     return _first_exe("~/offsetexplorer*/commandline",
-                      "/opt/offsetexplorer*/commandline")
+                      "~/offset-explorer*/commandline",
+                      "/opt/offsetexplorer*/commandline",
+                      "/opt/offset-explorer*/commandline",
+                      "/snap/offset-explorer/current/commandline")
 
 
 def compass_bin():
@@ -993,17 +1009,47 @@ def stop_offsetexplorer(timeout=20):
     return not offsetexplorer_running()
 
 
+def offsetexplorer_connections_file():
+    """Locate Offset Explorer's connections.xml. The data-dir name tracks the
+    install version (offsetexplorer4 -> ~/.offsetexplorer4, offsetexplorer5 ->
+    ~/.offsetexplorer5, older Kafka Tool -> ~/.kafkatool2) and differs from
+    machine to machine, so derive it from the installed app rather than hardcode
+    a version — otherwise the CLI writes one file and we verify another, and a
+    good save reads back as 'Not saved'."""
+    existing = []
+    for pat in ("~/.offsetexplorer*", "~/.kafkatool*"):
+        for d in glob.glob(os.path.expanduser(pat)):
+            f = os.path.join(d, "connections.xml")
+            if os.path.isfile(f):
+                existing.append(f)
+    derived = ""
+    exe = offsetexplorer_cli() or offsetexplorer_gui()
+    if exe:
+        base = os.path.basename(os.path.dirname(exe))   # e.g. offsetexplorer4
+        if base:
+            derived = os.path.expanduser("~/." + base + "/connections.xml")
+    # The install-derived dir is where this machine's CLI writes; trust it if the
+    # file is already there. Otherwise fall back to whatever data file exists
+    # (newest), and finally to the derived path (the CLI creates it on first save).
+    if derived and os.path.isfile(derived):
+        return derived
+    if existing:
+        existing.sort(key=os.path.getmtime, reverse=True)
+        return existing[0]
+    return derived or os.path.expanduser("~/.offsetexplorer4/connections.xml")
+
+
 def cluster_in_connections(cluster):
-    """True if a connection with this name is present in Offset Explorer's saved
-    file. Reads only the file's connection names, never the stored secrets."""
-    conn = os.path.expanduser("~/.offsetexplorer4/connections.xml")
+    """Return (found, file_checked): whether a connection with this name is in
+    Offset Explorer's saved file. Reads only connection names, never secrets."""
+    conn = offsetexplorer_connections_file()
     try:
         with open(conn, "r", encoding="utf-8", errors="ignore") as f:
             data = f.read()
     except OSError:
-        return False
+        return False, conn
     names = set(re.findall(r'name="([^"]*)"', data))
-    return cluster in names
+    return cluster in names, conn
 
 
 def certs_apps():
@@ -1012,6 +1058,25 @@ def certs_apps():
         "offsetexplorerCli": bool(offsetexplorer_cli()),
         "compass": bool(compass_bin()),
     }
+
+
+def pick_directory(title="Choose a folder"):
+    """Open a native folder picker on the user's desktop and return the chosen
+    absolute path, so cert folders can be picked instead of typed. Returns None
+    if no picker tool is installed, "" if the user cancelled."""
+    tool = shutil.which("zenity") or shutil.which("qarma")
+    if tool:
+        argv = [tool, "--file-selection", "--directory", "--title", title]
+    elif shutil.which("kdialog"):
+        argv = [shutil.which("kdialog"), "--getexistingdirectory",
+                os.path.expanduser("~")]
+    else:
+        return None
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+    except Exception:
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1174,7 +1239,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/jenkins/trigger":
             self._handle_jenkins_trigger()
         elif path == "/api/settings":
-            cfg = save_settings(self._read_json())
+            try:
+                cfg = save_settings(self._read_json())
+            except Exception as exc:
+                # e.g. settings.json not writable — say so instead of returning
+                # an empty response that just looks like "it didn't save".
+                self._send_json({"ok": False,
+                                 "error": "could not write %s: %s" % (SETTINGS_PATH, exc)}, 500)
+                return
             self._send_json({"ok": True, "settings": cfg})
         elif path == "/api/github/auth":
             data = self._read_json()
@@ -1191,8 +1263,22 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_certs_launch()
         elif path == "/api/certs/kafka-add":
             self._handle_kafka_add()
+        elif path == "/api/pick-folder":
+            self._handle_pick_folder()
         else:
             self.send_error(404, "Not found")
+
+    def _handle_pick_folder(self):
+        title = (self._read_json().get("title") or "Choose a folder")[:120]
+        path = pick_directory(title)
+        if path is None:
+            self._send_json({"ok": False, "unavailable": True,
+                             "error": "no folder picker found (install zenity) — type the path instead"})
+            return
+        if not path:
+            self._send_json({"ok": False, "cancelled": True})
+            return
+        self._send_json({"ok": True, "path": path, "isdir": os.path.isdir(path)})
 
     def _handle_certs_launch(self):
         data = self._read_json()
@@ -1279,18 +1365,28 @@ class Handler(BaseHTTPRequestHandler):
         low = out.lower()
         dup = "already exist" in low
         # The authoritative check: is the cluster now in the saved connections file?
-        saved = cluster_in_connections(cluster)
+        saved, connfile = cluster_in_connections(cluster)
         ok = err is None and (saved or dup)
         reopened = False
         if closed:                       # put OE back exactly as we found it
             rok, _ = _spawn([offsetexplorer_gui()])
             reopened = rok
+        if ok:
+            err_msg = None
+        elif err:
+            err_msg = err
+        elif out:
+            # CLI ran but the cluster didn't land in the file we checked — name the
+            # file so a mismatched Offset Explorer data dir is obvious on any machine.
+            err_msg = out[-300:] + "  [checked " + connfile + "]"
+        else:
+            err_msg = "cluster was not written to " + connfile
         self._send_json({
             "ok": ok, "cluster": cluster, "duplicate": dup,
             "wasRunning": was_running, "closed": closed, "reopened": reopened,
+            "connectionsFile": connfile,
             "output": out[-500:],
-            "error": None if ok else (err or out[-300:]
-                                      or "cluster was not written to Offset Explorer"),
+            "error": err_msg,
         })
 
     def _handle_certs_open(self):

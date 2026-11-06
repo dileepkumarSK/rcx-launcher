@@ -430,6 +430,9 @@ body {
   display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap;
 }
 .jk-row { display: flex; flex-direction: column; gap: 4px; }
+.cert-inline { display: flex; gap: 8px; align-items: center; }
+.cert-inline .jk-input { flex: 1; min-width: 0; }
+.cert-choose { white-space: nowrap; flex: none; }
 .jk-label { font-size: 11px; color: var(--text-dim); font-weight: 600; text-transform: uppercase; letter-spacing: .4px; }
 .jk-input {
   background: var(--bg-elev); color: var(--text);
