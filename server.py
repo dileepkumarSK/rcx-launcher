@@ -13,6 +13,7 @@ import http.cookiejar
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import ssl
@@ -34,6 +35,8 @@ JENKINS_JOBS_CACHE = os.path.join(HERE, ".jenkins_jobs_cache.json")
 SETTINGS_PATH = os.path.join(HERE, "settings.json")
 GITHUB_PATH = os.path.join(HERE, "github.json")
 SYNC_SCRIPT = os.path.join(HERE, "sync_wiki.py")
+AWS_ENVS_PATH = os.path.join(HERE, "aws_envs.json")
+AWS_SYNC_SCRIPT = os.path.join(HERE, "sync_aws_envs.py")
 DEFAULT_PORT = 8766
 
 # Dynamic configuration (overridable via settings.json, no code edits needed).
@@ -740,6 +743,107 @@ def open_url(url):
 
 
 # ---------------------------------------------------------------------------
+# AWS / rcx environments
+#
+# The launcher owns its own environment list (aws_envs.json, seeded once from the
+# user's shell recipes by sync_aws_envs.py) and builds the `rcx` login/run command
+# itself — it never invokes the shell aliases at runtime. Each env opens a local
+# terminal that (a) logs into AWS SSO only if the token is expired, then (b) runs
+# rcx for that profile/region/backend/tenant inside the rcf venv.
+# ---------------------------------------------------------------------------
+TERMINALS = ("gnome-terminal", "konsole", "tilix", "xfce4-terminal",
+             "x-terminal-emulator", "xterm")
+
+
+def load_aws_envs():
+    try:
+        with open(AWS_ENVS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {"envs": [], "rcf_dir": "", "venv_activate": "venv/bin/activate",
+                "sso_session": "login", "start_url": "", "missing": True}
+    data.setdefault("envs", [])
+    data.setdefault("venv_activate", "venv/bin/activate")
+    data.setdefault("sso_session", "login")
+    return data
+
+
+def aws_profiles_from_config():
+    """Account id / role / region per profile, read from ~/.aws/config (no secrets)."""
+    out = {}
+    try:
+        with open(os.path.expanduser("~/.aws/config"), encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return out
+    for m in re.finditer(r"(?m)^\[profile\s+([^\]]+)\]\s*$", txt):
+        name = m.group(1).strip()
+        block = txt[m.end():]
+        nxt = block.find("\n[")
+        block = block[:nxt] if nxt != -1 else block
+        def g(k):
+            mm = re.search(r"(?m)^\s*" + k + r"\s*=\s*(\S+)", block)
+            return mm.group(1).strip() if mm else ""
+        out[name] = {"account": g("sso_account_id"), "role": g("sso_role_name"),
+                     "region": g("region")}
+    return out
+
+
+def find_terminal():
+    for t in TERMINALS:
+        exe = shutil.which(t)
+        if exe:
+            return t, exe
+    return None, None
+
+
+def open_terminal(inner):
+    """Open `inner` (a bash snippet) in a new local terminal window, via an
+    interactive shell, keeping the window open afterwards. Returns (ok, message)."""
+    name, exe = find_terminal()
+    if not exe:
+        return False, "no terminal emulator found (install gnome-terminal)"
+    full = inner + "\nexec bash"
+    if name == "gnome-terminal":
+        argv = [exe, "--", "bash", "-ic", full]
+    else:                                   # konsole / xfce4 / xterm / x-terminal-emulator
+        argv = [exe, "-e", "bash", "-ic", full]
+    return _spawn(argv)
+
+
+def build_rcx_command(env, meta):
+    """The self-contained bash command that opens one rcx environment: set the AWS
+    vars, SSO-login only if the cached token is expired, activate the rcf venv, run
+    rcx. Values are shell-quoted; no shell alias is used."""
+    rcf = meta.get("rcf_dir") or ""
+    activate = meta.get("venv_activate") or "venv/bin/activate"
+    sess = meta.get("sso_session") or "login"
+    profile = env.get("profile") or ""
+    parts = []
+    if rcf:
+        parts.append("cd %s" % shlex.quote(rcf))
+    for k, v in (("AWS_REGION", env.get("region")),
+                 ("RCX_BACKEND", env.get("backend")),
+                 ("RCX_TENANT", env.get("tenant")),
+                 ("AWS_PROFILE", profile)):
+        if v:
+            parts.append("export %s=%s" % (k, shlex.quote(v)))
+    pq = shlex.quote(profile)
+    parts.append('echo "Checking AWS SSO session for profile %s…"' % profile)
+    # Log in only when the cached SSO token is missing/expired.
+    parts.append("aws sts get-caller-identity --profile %s >/dev/null 2>&1 || "
+                 "aws sso login --sso-session %s" % (pq, shlex.quote(sess)))
+    parts.append("source %s" % shlex.quote(activate))
+    parts.append("rcx")
+    return " && ".join(parts)
+
+
+def build_sso_login_command(meta):
+    sess = meta.get("sso_session") or "login"
+    return "aws sso login --sso-session %s" % shlex.quote(sess)
+
+
+# ---------------------------------------------------------------------------
 # Kafka / Mongo cert bundles: scan a local folder of downloaded cert bundles and
 # turn each into copy-ready connection settings. Secrets (keystore passwords, DB
 # passwords) live only in the user's local files; they're read on demand and sent
@@ -788,6 +892,56 @@ def _client_env(dirpath, root):
     return client, env
 
 
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def vpn_for_cert(client, env, path):
+    """Best-guess NetworkManager VPN for a Kafka/Mongo cert bundle, reusing the
+    exact per-client/per-tier VPN names already resolved in config.json (the same
+    ones the Kibana/NiFi links use). Matches the bundle's client folder to a config
+    client, then its environment: first by an env name that appears in the bundle's
+    text (so 'perf2' beats 'perf'), else by tier (prod / perf / lower). Returns the
+    VPN name, or None when nothing matches (e.g. a local-only bundle) — the UI shows
+    this as an editable suggestion, so a wrong guess is visible and overridable."""
+    clients = load_config().get("clients", [])
+    cn = _norm(client)
+    if not cn:
+        return None
+    match = None
+    for cl in clients:
+        ccn = _norm(cl.get("name"))
+        if ccn and (ccn == cn or cn.startswith(ccn) or ccn.startswith(cn)):
+            match = cl
+            break
+    if not match:
+        return None
+    envs = [e for e in match.get("environments", []) if e.get("vpn")]
+    if not envs:
+        return None
+    txt = _norm(client + " " + env + " " + os.path.basename(path))
+    # 1) a config env name that literally appears in the bundle text; prefer the
+    #    longest such match so "Perf2" wins over "Perf".
+    best = None
+    for e in envs:
+        en = _norm(e.get("name"))
+        if en and en in txt and (best is None or len(en) > best[0]):
+            best = (len(en), e.get("vpn"))
+    if best:
+        return best[1]
+    # 2) fall back to tier inferred from the bundle text.
+    tier = "prod" if "prod" in txt else ("perf" if "perf" in txt else "lower")
+    for e in envs:
+        vl = _norm(e.get("name") + (e.get("vpn") or ""))
+        if tier == "prod" and "prod" in vl:
+            return e.get("vpn")
+        if tier == "perf" and "perf" in vl and "prod" not in vl:
+            return e.get("vpn")
+        if tier == "lower" and "prod" not in vl and "perf" not in vl:
+            return e.get("vpn")
+    return envs[0].get("vpn")
+
+
 def scan_cert_bundles(kind):
     """Each directory that holds a relevant cert file is one bundle (metadata only)."""
     exts = _CERT_EXTS[kind]
@@ -806,6 +960,7 @@ def scan_cert_bundles(kind):
                 "name": os.path.basename(dirpath) or client,
                 "files": certs,
                 "hasDetails": any(_is_details(f) for f in files),
+                "vpn": vpn_for_cert(client, env, dirpath),
             }
     return sorted(out.values(), key=lambda b: (b["client"].lower(), b["env"].lower()))
 
@@ -1156,8 +1311,31 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_certs_list()
         elif path == "/api/certs/connect":
             self._handle_certs_connect()
+        elif path == "/api/aws/envs":
+            self._handle_aws_envs()
         else:
             self._serve_static(path)
+
+    def _handle_aws_envs(self):
+        meta = load_aws_envs()
+        profs = aws_profiles_from_config()
+        envs = []
+        for e in meta.get("envs", []):
+            p = profs.get(e.get("profile"), {})
+            envs.append({**e, "account": p.get("account", ""),
+                         "role": p.get("role", "")})
+        _, term = find_terminal()
+        self._send_json({
+            "ok": True,
+            "rcfDir": meta.get("rcf_dir", ""),
+            "ssoSession": meta.get("sso_session", "login"),
+            "startUrl": meta.get("start_url", ""),
+            "generatedAt": meta.get("generated_at", ""),
+            "hasTerminal": bool(term),
+            "hasRcf": bool(meta.get("rcf_dir") and os.path.isdir(meta.get("rcf_dir", ""))),
+            "missing": bool(meta.get("missing")),
+            "envs": envs,
+        })
 
     def _handle_certs_list(self):
         q = parse_qs(urlparse(self.path).query)
@@ -1170,6 +1348,7 @@ class Handler(BaseHTTPRequestHandler):
                          "searchHome": bool(load_settings().get("certs_search_home")),
                          "exists": os.path.isdir(root),
                          "apps": certs_apps(),
+                         "vpns": sorted(known_vpn_names()),
                          "bundles": scan_cert_bundles(kind)})
 
     def _handle_certs_connect(self):
@@ -1265,8 +1444,49 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_kafka_add()
         elif path == "/api/pick-folder":
             self._handle_pick_folder()
+        elif path == "/api/aws/terminal":
+            self._handle_aws_terminal()
+        elif path == "/api/aws/login":
+            self._handle_aws_login()
+        elif path == "/api/aws/sync":
+            self._handle_aws_sync()
         else:
             self.send_error(404, "Not found")
+
+    def _handle_aws_terminal(self):
+        name = (self._read_json().get("name") or "").strip()
+        meta = load_aws_envs()
+        env = next((e for e in meta.get("envs", []) if e.get("name") == name), None)
+        if not env:
+            self._send_json({"ok": False, "error": "unknown environment"}, 400)
+            return
+        rcf = meta.get("rcf_dir") or ""
+        if not rcf or not os.path.isdir(rcf):
+            self._send_json({"ok": False,
+                             "error": "rcf project dir not found: %s — re-run sync_aws_envs.py" % (rcf or "(unset)")}, 404)
+            return
+        ok, msg = open_terminal(build_rcx_command(env, meta))
+        self._send_json({"ok": ok, "name": name, "profile": env.get("profile"),
+                         "error": None if ok else msg})
+
+    def _handle_aws_login(self):
+        meta = load_aws_envs()
+        ok, msg = open_terminal(build_sso_login_command(meta))
+        self._send_json({"ok": ok, "error": None if ok else msg})
+
+    def _handle_aws_sync(self):
+        """Re-seed aws_envs.json from the shell recipes (reference only)."""
+        try:
+            r = subprocess.run([sys.executable, AWS_SYNC_SCRIPT],
+                               capture_output=True, text=True, timeout=30)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        if r.returncode != 0:
+            self._send_json({"ok": False, "error": (r.stderr or r.stdout or "sync failed").strip()[-400:]}, 500)
+            return
+        meta = load_aws_envs()
+        self._send_json({"ok": True, "count": len(meta.get("envs", []))})
 
     def _handle_pick_folder(self):
         title = (self._read_json().get("title") or "Choose a folder")[:120]
@@ -1283,13 +1503,31 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_certs_launch(self):
         data = self._read_json()
         app = data.get("app")
+        # Bring the cluster's VPN up first — Offset Explorer / Compass can't reach
+        # the broker/DB without it. The VPN name is validated against the known set
+        # (config + live nmcli), so only real connection names are ever run. If the
+        # VPN fails we stop here and report it, rather than opening an app that will
+        # just hang on connect.
+        vpn = (data.get("vpn") or "").strip()
+        vpn_ok, vpn_msg = True, None
+        if vpn:
+            if vpn not in known_vpn_names():
+                self._send_json({"ok": False, "vpn": vpn,
+                                 "error": "unknown VPN name: " + vpn}, 400)
+                return
+            vpn_ok, vpn_msg = vpn_up(vpn)
+            if not vpn_ok:
+                self._send_json({"ok": False, "vpn": vpn, "vpnConnected": False,
+                                 "error": "VPN %s: %s" % (vpn, vpn_msg)}, 502)
+                return
         if app == "offsetexplorer":
             exe = offsetexplorer_gui()
             if not exe:
                 self._send_json({"ok": False, "error": "Offset Explorer not found"}, 404)
                 return
             ok, msg = _spawn([exe])
-            self._send_json({"ok": ok, "error": None if ok else msg})
+            self._send_json({"ok": ok, "vpn": vpn or None, "vpnConnected": bool(vpn),
+                             "vpnMessage": vpn_msg, "error": None if ok else msg})
             return
         if app == "compass":
             exe = compass_bin()
@@ -1301,7 +1539,8 @@ class Handler(BaseHTTPRequestHandler):
             if path and _cert_path_ok("mongo", path) and os.path.isdir(path):
                 argv.append(mongo_connect(path)["uri"])
             ok, msg = _spawn(argv)
-            self._send_json({"ok": ok, "error": None if ok else msg})
+            self._send_json({"ok": ok, "vpn": vpn or None, "vpnConnected": bool(vpn),
+                             "vpnMessage": vpn_msg, "error": None if ok else msg})
             return
         self._send_json({"ok": False, "error": "unknown app"}, 400)
 

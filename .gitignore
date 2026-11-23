@@ -8,6 +8,7 @@ config.json
 settings.json
 favorites.json
 .jenkins_jobs_cache.json
+aws_envs.json
 
 # --- Python / runtime cruft ---
 __pycache__/

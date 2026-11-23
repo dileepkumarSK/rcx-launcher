@@ -365,6 +365,37 @@ body {
   background: linear-gradient(180deg, rgba(18,161,80,.06), var(--bg-elev)); }
 .clientcard.mongocard:hover { border-color: var(--t-mongo); box-shadow: 0 6px 18px rgba(18,161,80,.15); }
 .clientcard.mongocard .cc-name { color: var(--t-mongo); }
+.clientcard.awscard { border-color: #ff9900;
+  background: linear-gradient(180deg, rgba(255,153,0,.07), var(--bg-elev)); }
+.clientcard.awscard:hover { border-color: #ff9900; box-shadow: 0 6px 18px rgba(255,153,0,.18); }
+.clientcard.awscard .cc-name { color: #e07d00; }
+
+/* ---- AWS / rcx terminals ---- */
+.aws-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.awsenv {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 11px; padding: 10px 12px;
+}
+.awsenv-info { min-width: 0; flex: 1; }
+.awsenv-name { font-weight: 650; font-size: 14px; word-break: break-word; }
+.awsenv-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 3px; }
+.awsenv-tag {
+  font-size: 11px; font-weight: 700; color: #b35e00;
+  background: rgba(255,153,0,.14); border-radius: 5px; padding: 1px 7px;
+}
+.awsenv-sub { font-size: 11.5px; color: var(--text-faint); }
+.awsenv .btn-primary { flex: none; white-space: nowrap; }
+.aws-warn {
+  display: flex; gap: 8px; align-items: flex-start;
+  background: var(--bg-elev2); border-left: 3px solid var(--amber);
+  border-radius: 6px; padding: 8px 11px; margin: 0 0 14px;
+  font-size: 12.5px; color: var(--text-dim);
+}
+.aws-warn-ic { color: var(--amber); }
 
 /* ---- Kafka / Mongo cert bundles ---- */
 .certs-root { color: var(--text-dim); font-size: 12.5px; margin: 2px 0 16px; }
@@ -433,6 +464,8 @@ body {
 .cert-inline { display: flex; gap: 8px; align-items: center; }
 .cert-inline .jk-input { flex: 1; min-width: 0; }
 .cert-choose { white-space: nowrap; flex: none; }
+.cert-vpn { align-items: center; margin-top: 4px; }
+.cert-vpn .cert-vpn-input { flex: 1; min-width: 0; max-width: 260px; }
 .jk-label { font-size: 11px; color: var(--text-dim); font-weight: 600; text-transform: uppercase; letter-spacing: .4px; }
 .jk-input {
   background: var(--bg-elev); color: var(--text);

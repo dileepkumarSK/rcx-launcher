@@ -21,6 +21,7 @@ const JENKINS_KEY = "@jenkins"; // sentinel "client" = the Jenkins troubleshoote
 const KAFKA_KEY = "@kafka"; // sentinel "client" = the Kafka certs view
 const MONGO_KEY = "@mongo"; // sentinel "client" = the Mongo certs view
 const SETTINGS_KEY = "@settings"; // sentinel "client" = the Settings view
+const AWS_KEY = "@aws"; // sentinel "client" = the AWS / rcx terminals view
 
 let CONFIG = { clients: [], repos: [] };
 let activeVpns = new Set();
@@ -29,6 +30,7 @@ let jkRepoMap = null;       // repo display label -> job url
 let jkBranchMap = {};       // branch name -> job url (for the selected repo)
 let jkPoll = null;          // timer id for the active build-status poll
 let certApps = {};          // which desktop clients are installed (offsetexplorer/compass)
+let certVpns = [];          // known VPN names, for the per-bundle VPN override datalist
 let selected = null; // client name, PROD_KEY, REPOS_KEY, JENKINS_KEY, or null for the picker
 
 function repoList() { return CONFIG.repos || []; }
@@ -118,6 +120,7 @@ function renderNav() {
   nav.append(navChip("jenkins", JENKINS_KEY, "Builds"));
   nav.append(navChip("kafka", KAFKA_KEY, "Kafka"));
   nav.append(navChip("mongo", MONGO_KEY, "Mongo"));
+  nav.append(navChip("aws", AWS_KEY, "AWS"));
   nav.append(navChip("settings", SETTINGS_KEY, "Settings"));
   for (const client of CONFIG.clients) {
     const chip = el("a", "navchip" + (client.name === selected ? " active" : ""), client.name);
@@ -135,6 +138,7 @@ function render() {
   else if (selected === JENKINS_KEY) renderJenkinsView();
   else if (selected === KAFKA_KEY) renderCertsView("kafka");
   else if (selected === MONGO_KEY) renderCertsView("mongo");
+  else if (selected === AWS_KEY) renderAwsView();
   else if (selected === SETTINGS_KEY) renderSettingsView();
   else if (selected && getClient(selected)) renderClientView(selected);
   else renderPicker();
@@ -209,6 +213,14 @@ function renderPicker() {
   mcard.append(el("div", "cc-sub", "pick a bundle → copy a mongodb:// URI or make a Compass import"));
   mcard.addEventListener("click", () => { location.hash = MONGO_KEY; });
   grid.append(mcard);
+
+  const acard = el("button", "clientcard awscard");
+  acard.dataset.text = "aws rcx rcf sso login terminal profile sei mgm wu bp ta 7gt spwy dev7 prod perf";
+  acard.append(el("div", "cc-name", "AWS"));
+  acard.append(el("div", "cc-count", "rcx terminals · SSO login"));
+  acard.append(el("div", "cc-sub", "pick an env → opens a terminal, SSO-logs in, runs rcx"));
+  acard.addEventListener("click", () => { location.hash = AWS_KEY; });
+  grid.append(acard);
 
   const scard = el("button", "clientcard settingscard");
   scard.dataset.text = "settings credentials github jenkins token config";
@@ -914,6 +926,7 @@ async function renderCertsView(kind) {
   body.innerHTML = "";
   if (!data.ok) { body.append(el("div", "jk-err", "✗ " + (data.error || "failed"))); return; }
   certApps = data.apps || {};
+  certVpns = data.vpns || [];
   const appInstalled = kind === "kafka" ? certApps.offsetexplorer : certApps.compass;
   if (!appInstalled) openApp.remove();
 
@@ -1014,6 +1027,36 @@ function certRow(parent, label, value, opts) {
   return row;
 }
 
+// A small "VPN" row for a cert panel: auto-filled with the VPN resolved for this
+// bundle (same names the env links use), editable to override, remembered per
+// bundle in localStorage. Its .get() is read by the Open buttons so the VPN is
+// brought up before Offset Explorer / Compass launches.
+function certVpnControl(b) {
+  const key = "rcx:certvpn:" + b.path;
+  let saved = null;
+  try { saved = localStorage.getItem(key); } catch (e) { /* private mode */ }
+  const current = saved !== null ? saved : (b.vpn || "");
+
+  if (!document.getElementById("cert-vpn-list")) {
+    const dl = el("datalist"); dl.id = "cert-vpn-list";
+    for (const v of certVpns) { const o = el("option"); o.value = v; dl.append(o); }
+    document.body.append(dl);
+  }
+
+  const row = el("div", "cert-kv cert-vpn");
+  row.append(el("span", "cert-k", "VPN"));
+  const input = el("input", "jk-input cert-vpn-input");
+  input.setAttribute("list", "cert-vpn-list");
+  input.placeholder = "none — opens without a VPN";
+  input.value = current;
+  input.title = "Brought up before opening. Auto-picked from the cluster; edit to override (remembered on this machine).";
+  input.addEventListener("change", () => {
+    try { localStorage.setItem(key, input.value.trim()); } catch (e) { /* private mode */ }
+  });
+  row.append(input);
+  return { row, get: () => input.value.trim() };
+}
+
 function renderKafkaPanel(panel, res, b) {
   certRow(panel, "Cluster", res.cluster);
   certRow(panel, "Bootstrap", res.bootstrap, { mono: true });
@@ -1022,6 +1065,8 @@ function renderKafkaPanel(panel, res, b) {
   certRow(panel, "  ↳ password", res.truststore.password, { secret: true });
   certRow(panel, "Keystore", res.keystore.file, { mono: true, copyValue: res.keystore.path });
   certRow(panel, "  ↳ password", res.keystore.password, { secret: true });
+  const vpnCtl = certVpnControl(b);
+  panel.append(vpnCtl.row);
 
   const all = [
     "Cluster name: " + res.cluster,
@@ -1043,7 +1088,7 @@ function renderKafkaPanel(panel, res, b) {
   row.append(copyAll);
   if (certApps.offsetexplorer) {
     const open = el("button", "btn-ghost", "Open Offset Explorer");
-    open.addEventListener("click", () => launchApp("offsetexplorer", null, open));
+    open.addEventListener("click", () => launchApp("offsetexplorer", null, open, vpnCtl.get()));
     row.append(open);
   }
   panel.append(row);
@@ -1070,10 +1115,13 @@ function renderMongoPanel(panel, res, b) {
   uriWrap.append(ta);
   panel.append(uriWrap);
 
+  const vpnCtl = certVpnControl(b);
+  panel.append(vpnCtl.row);
+
   const row = el("div", "certcard-actions");
   if (certApps.compass) {
     const openc = el("button", "btn-primary", "Open in Compass");
-    openc.addEventListener("click", () => launchApp("compass", b.path, openc));
+    openc.addEventListener("click", () => launchApp("compass", b.path, openc, vpnCtl.get()));
     row.append(openc);
   }
   const copyUri = el("button", certApps.compass ? "btn-ghost" : "btn-primary", "Copy URI");
@@ -1129,16 +1177,26 @@ async function addToOffset(path, btn) {
   finally { btn.disabled = false; btn.textContent = label; }
 }
 
-async function launchApp(app, path, btn) {
+async function launchApp(app, path, btn, vpn) {
   const label = btn.textContent;
+  const appName = app === "compass" ? "Compass" : "Offset Explorer";
   btn.disabled = true;
+  const needVpn = vpn && !activeVpns.has(vpn);
+  if (needVpn) { btn.textContent = "Connecting VPN…"; toast("Connecting VPN " + vpn + "…", "info", "then opening " + appName); }
   try {
     const res = await api("/api/certs/launch", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ app, path }),
+      body: JSON.stringify({ app, path, vpn: vpn || null }),
     });
-    if (res.ok) toast("Opening " + (app === "compass" ? "Compass" : "Offset Explorer") + "…", "ok");
-    else toast("Could not open", "err", res.error || "");
+    if (res.ok) {
+      if (res.vpn) { activeVpns.add(res.vpn); refreshConnected(); }
+      const sub = res.vpn
+        ? (res.vpnMessage === "already connected" ? "VPN " + res.vpn + " already up" : "VPN " + res.vpn + " connected")
+        : "";
+      toast("Opening " + appName + "…", "ok", sub);
+    } else {
+      toast(res.vpnConnected === false ? "VPN did not connect" : "Could not open", "err", res.error || "");
+    }
   } catch (e) { toast("Request failed", "err", String(e)); }
   finally { btn.disabled = false; btn.textContent = label; }
 }
@@ -1169,6 +1227,128 @@ function fallbackCopy(text, done) {
   document.body.append(ta); ta.select();
   try { document.execCommand("copy"); done(); } catch (e) { toast("Copy failed — select and copy manually", "err"); }
   ta.remove();
+}
+
+/* ---- AWS / rcx terminals ---- */
+async function renderAwsView() {
+  const main = $("#main");
+  main.innerHTML = "";
+  $("#filter").value = "";
+  $("#filter").placeholder = "Filter rcx environments…  (/ to focus)";
+
+  const head = el("div", "view-head");
+  const back = el("button", "backbtn", "← Clients");
+  back.addEventListener("click", showPicker);
+  head.append(back);
+  head.append(el("h1", "page-title", "AWS"));
+  const count = el("span", "count", "rcx environments");
+  head.append(count);
+  const login = el("button", "btn-ghost", "⎋ AWS SSO login");
+  login.style.marginLeft = "auto";
+  login.title = "Open a terminal and run aws sso login (opens the browser once)";
+  login.addEventListener("click", () => awsLogin(login));
+  head.append(login);
+  main.append(head);
+
+  const body = el("div");
+  body.append(el("div", "jk-sub", "Loading environments…"));
+  main.append(body);
+
+  let data;
+  try { data = await api("/api/aws/envs"); }
+  catch (e) { body.innerHTML = ""; body.append(el("div", "jk-err", "✗ " + String(e))); return; }
+  body.innerHTML = "";
+  if (!data.ok) { body.append(el("div", "jk-err", "✗ " + (data.error || "failed"))); return; }
+
+  // a short status line: where rcx runs + the SSO start URL
+  const info = el("div", "certs-root");
+  if (data.rcfDir) { info.append(document.createTextNode("rcf: ")); info.append(el("code", null, data.rcfDir)); }
+  if (data.startUrl) { info.append(document.createTextNode("  ·  SSO: ")); info.append(el("code", null, data.startUrl)); }
+  body.append(info);
+
+  if (!data.hasTerminal) {
+    body.append(warnRow("No terminal emulator found — install gnome-terminal to open rcx terminals."));
+  }
+  if (!data.hasRcf) {
+    body.append(warnRow("rcf project dir not found" + (data.rcfDir ? " (" + data.rcfDir + ")" : "")
+      + " — rcx can't launch until it exists. Re-run sync_aws_envs.py after fixing the path."));
+  }
+
+  if (!data.envs.length) {
+    const e = el("div", "empty");
+    e.textContent = data.missing
+      ? "No aws_envs.json yet — run  python3 sync_aws_envs.py  to seed it."
+      : "No rcx environments found.";
+    body.append(e);
+    count.textContent = "0 envs";
+    return;
+  }
+  count.textContent = data.envs.length + (data.envs.length === 1 ? " env" : " envs");
+
+  const byClient = {};
+  for (const e of data.envs) (byClient[e.client] = byClient[e.client] || []).push(e);
+  for (const client of Object.keys(byClient).sort((a, c) => a.toLowerCase().localeCompare(c.toLowerCase()))) {
+    const sec = el("div", "certs-group");
+    sec.append(el("div", "certs-client", client.toUpperCase()));
+    const grid = el("div", "aws-grid");
+    for (const e of byClient[client]) grid.append(renderAwsEnv(e));
+    sec.append(grid);
+    body.append(sec);
+  }
+}
+
+function warnRow(text) {
+  const d = el("div", "aws-warn");
+  d.append(el("span", "aws-warn-ic", "⚠"));
+  d.append(el("span", null, text));
+  return d;
+}
+
+function renderAwsEnv(e) {
+  const card = el("div", "awsenv");
+  card.dataset.text = (e.name + " " + e.client + " " + e.profile + " " + e.backend + " " + e.tenant + " " + (e.account || "")).toLowerCase();
+  const info = el("div", "awsenv-info");
+  info.append(el("div", "awsenv-name", e.name));
+  const meta = el("div", "awsenv-meta");
+  meta.append(el("span", "awsenv-tag", e.profile));
+  if (e.tenant) meta.append(el("span", "awsenv-sub", e.tenant));
+  if (e.region) meta.append(el("span", "awsenv-sub", e.region));
+  info.append(meta);
+  card.append(info);
+  const open = el("button", "btn-primary", "Open terminal");
+  open.title = "cd rcf · SSO login if needed · AWS_PROFILE=" + e.profile
+    + (e.backend ? " · " + e.backend : "") + (e.tenant ? "/" + e.tenant : "") + " · rcx";
+  open.addEventListener("click", () => openAwsTerminal(e.name, open));
+  card.append(open);
+  return card;
+}
+
+async function openAwsTerminal(name, btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Opening…";
+  try {
+    const res = await api("/api/aws/terminal", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (res.ok) toast("Opening terminal: " + name, "ok", "SSO-logs in if needed, then runs rcx");
+    else toast("Could not open terminal", "err", res.error || "");
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+async function awsLogin(btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Opening…";
+  try {
+    const res = await api("/api/aws/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (res.ok) toast("AWS SSO login opened in a terminal", "ok", "finish it in the browser if prompted");
+    else toast("Could not open login", "err", res.error || "");
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
 }
 
 /* ---- Settings (credentials + dynamic sources) ---- */
@@ -1572,6 +1752,7 @@ function syncFromHash() {
   else if (want === JENKINS_KEY) next = JENKINS_KEY;
   else if (want === KAFKA_KEY) next = KAFKA_KEY;
   else if (want === MONGO_KEY) next = MONGO_KEY;
+  else if (want === AWS_KEY) next = AWS_KEY;
   else if (want === SETTINGS_KEY) next = SETTINGS_KEY;
   else if (CONFIG.clients.some(c => c.name === want)) next = want;
   if (next !== selected) { selected = next; $("#filter").value = ""; }
