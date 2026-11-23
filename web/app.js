@@ -1229,72 +1229,203 @@ function fallbackCopy(text, done) {
   ta.remove();
 }
 
-/* ---- AWS / rcx terminals ---- */
+/* ---- AWS accounts (pulled from SSO, cached; refresh = re-pull/sync) ---- */
 async function renderAwsView() {
   const main = $("#main");
   main.innerHTML = "";
   $("#filter").value = "";
-  $("#filter").placeholder = "Filter rcx environments…  (/ to focus)";
+  $("#filter").placeholder = "Filter AWS accounts…  (/ to focus)";
 
   const head = el("div", "view-head");
   const back = el("button", "backbtn", "← Clients");
   back.addEventListener("click", showPicker);
   head.append(back);
   head.append(el("h1", "page-title", "AWS"));
-  const count = el("span", "count", "rcx environments");
+  const count = el("span", "count", "accounts");
   head.append(count);
   const login = el("button", "btn-ghost", "⎋ AWS SSO login");
   login.style.marginLeft = "auto";
-  login.title = "Open a terminal and run aws sso login (opens the browser once)";
+  login.title = "Open a terminal and run aws sso login (browser opens once)";
   login.addEventListener("click", () => awsLogin(login));
-  head.append(login);
+  const refresh = el("button", "btn-ghost", "↻ Refresh");
+  refresh.title = "Re-pull all accounts from AWS SSO (sync) and update the cache";
+  refresh.addEventListener("click", () => awsRefresh(refresh));
+  head.append(login, refresh);
   main.append(head);
 
   const body = el("div");
-  body.append(el("div", "jk-sub", "Loading environments…"));
+  body.append(el("div", "jk-sub", "Loading AWS accounts…"));
   main.append(body);
 
   let data;
-  try { data = await api("/api/aws/envs"); }
+  try { data = await api("/api/aws/accounts"); }
   catch (e) { body.innerHTML = ""; body.append(el("div", "jk-err", "✗ " + String(e))); return; }
   body.innerHTML = "";
-  if (!data.ok) { body.append(el("div", "jk-err", "✗ " + (data.error || "failed"))); return; }
 
-  // a short status line: where rcx runs + the SSO start URL
   const info = el("div", "certs-root");
-  if (data.rcfDir) { info.append(document.createTextNode("rcf: ")); info.append(el("code", null, data.rcfDir)); }
-  if (data.startUrl) { info.append(document.createTextNode("  ·  SSO: ")); info.append(el("code", null, data.startUrl)); }
+  info.append(el("code", null, data.startUrl || "AWS SSO"));
+  info.append(document.createTextNode(data.loggedIn ? "  ·  signed in" : "  ·  not signed in"));
+  if (data.generatedAt) info.append(document.createTextNode("  ·  cached " + data.generatedAt.replace("T", " ")));
   body.append(info);
 
-  if (!data.hasTerminal) {
-    body.append(warnRow("No terminal emulator found — install gnome-terminal to open rcx terminals."));
-  }
-  if (!data.hasRcf) {
-    body.append(warnRow("rcf project dir not found" + (data.rcfDir ? " (" + data.rcfDir + ")" : "")
-      + " — rcx can't launch until it exists. Re-run sync_aws_envs.py after fixing the path."));
-  }
+  const profiles = data.profiles || [];
 
-  if (!data.envs.length) {
-    const e = el("div", "empty");
-    e.textContent = data.missing
-      ? "No aws_envs.json yet — run  python3 sync_aws_envs.py  to seed it."
-      : "No rcx environments found.";
-    body.append(e);
-    count.textContent = "0 envs";
+  // One-time cache: if nothing is cached yet and we're signed in, pull once.
+  // After that it's served from cache; use Refresh to re-sync.
+  if (!profiles.length) {
+    if (data.loggedIn) {
+      body.append(el("div", "jk-sub", "Pulling your accounts from AWS (first time)…"));
+      try {
+        const r = await api("/api/aws/pull", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        if (r.ok) { renderAwsView(); return; }
+        body.innerHTML = ""; body.append(info); body.append(warnRow("Could not pull accounts: " + (r.error || "")));
+      } catch (e) { body.innerHTML = ""; body.append(info); body.append(warnRow("Pull failed: " + String(e))); }
+      count.textContent = "0 accounts";
+      return;
+    }
+    body.append(warnRow("Not signed in — press “AWS SSO login”, finish it in the browser, then press Refresh."));
+    count.textContent = "0 accounts";
     return;
   }
-  count.textContent = data.envs.length + (data.envs.length === 1 ? " env" : " envs");
 
-  const byClient = {};
-  for (const e of data.envs) (byClient[e.client] = byClient[e.client] || []).push(e);
-  for (const client of Object.keys(byClient).sort((a, c) => a.toLowerCase().localeCompare(c.toLowerCase()))) {
-    const sec = el("div", "certs-group");
-    sec.append(el("div", "certs-client", client.toUpperCase()));
-    const grid = el("div", "aws-grid");
-    for (const e of byClient[client]) grid.append(renderAwsEnv(e));
-    sec.append(grid);
-    body.append(sec);
+  // Wiki-sourced environments (backend/tenant), grouped by profile. Built by
+  // sync_wiki_envs.py from the wiki + these pulled profiles — no bashrc needed.
+  let envsByProfile = {}, envMeta = {}, unmatchedEnvs = [];
+  try {
+    const ed = await api("/api/aws/envs");
+    envMeta = ed;
+    for (const e of (ed.envs || [])) {
+      if (e.profile) (envsByProfile[e.profile] = envsByProfile[e.profile] || []).push(e);
+      else unmatchedEnvs.push(e);
+    }
+  } catch (e) { /* envs optional; accounts still render */ }
+
+  const totalEnvs = Object.values(envsByProfile).reduce((n, a) => n + a.length, 0);
+  count.textContent = profiles.length + (profiles.length === 1 ? " account" : " accounts")
+    + (totalEnvs ? "  ·  " + totalEnvs + " envs" : "");
+  if (envMeta.generatedAt) info.append(document.createTextNode("  ·  envs " + envMeta.generatedAt.replace("T", " ")));
+  if (!envMeta.hasRcf) body.append(warnRow("rcf project dir not set — Open rcf needs it; configure in Settings or run sync."));
+
+  const grid = el("div", "aws-grid");
+  for (const p of profiles) grid.append(renderAwsAccount(p, data.session, envsByProfile[p.profile] || []));
+  body.append(grid);
+
+  if (unmatchedEnvs.length) {
+    const note = el("div", "aws-warn");
+    note.append(el("span", "aws-warn-ic", "⚠"));
+    note.append(el("span", null, unmatchedEnvs.length + " wiki environment(s) have no AWS account yet: "
+      + unmatchedEnvs.map(e => e.backend.replace("RCX-", "") + "/" + e.tenant).join(", ")));
+    body.append(note);
   }
+}
+
+function renderAwsAccount(p, session, envs) {
+  envs = envs || [];
+  const card = el("div", "awsacct");
+  card.dataset.text = (p.accountName + " " + p.profile + " " + p.accountId + " " + p.role
+    + " " + envs.map(e => e.backend + " " + e.tenant + " " + e.name).join(" ")).toLowerCase();
+  const row = el("div", "awsacct-row");
+  const inf = el("div", "awsenv-info awsacct-head");
+  const nameLine = el("div", "awsenv-name");
+  const caret = el("span", "awsacct-caret", envs.length ? "▸" : "");
+  nameLine.append(caret, document.createTextNode(p.accountName || p.profile));
+  inf.append(nameLine);
+  const meta = el("div", "awsenv-meta");
+  meta.append(el("span", "awsenv-tag", p.profile));
+  if (p.role) meta.append(el("span", "awsenv-sub", p.role));
+  meta.append(el("span", "awsenv-sub", p.accountId));
+  if (envs.length) meta.append(el("span", "awsenv-sub", envs.length + " env" + (envs.length === 1 ? "" : "s")));
+  inf.append(meta);
+  row.append(inf);
+  const openT = el("button", "btn-primary", "Open terminal");
+  openT.title = "Log in to profile " + p.profile + " and open rcf";
+  openT.addEventListener("click", () => openAwsProfileTerminal(p.profile, openT));
+  const cfgBtn = el("button", "btn-ghost", "Show config");
+  row.append(openT, cfgBtn);
+  card.append(row);
+
+  if (envs.length) {
+    const envWrap = el("div", "awsenv-list hidden");
+    for (const e of envs) envWrap.append(renderAwsEnvRow(e));
+    card.append(envWrap);
+    inf.style.cursor = "pointer";
+    inf.title = "Show environments";
+    inf.addEventListener("click", () => {
+      const open = !envWrap.classList.toggle("hidden");
+      caret.textContent = open ? "▾" : "▸";
+    });
+  }
+
+  const panel = el("pre", "aws-cfg hidden");
+  cfgBtn.addEventListener("click", () => {
+    const hidden = panel.classList.toggle("hidden");
+    cfgBtn.textContent = hidden ? "Show config" : "Hide config";
+    if (!hidden && !panel.dataset.filled) {
+      panel.dataset.filled = "1";
+      panel.textContent =
+        "[profile " + p.profile + "]\n" +
+        "sso_session = " + (session || "login") + "\n" +
+        "sso_account_id = " + p.accountId + "\n" +
+        "sso_role_name = " + p.role + "\n" +
+        "region = " + (p.region || "");
+    }
+  });
+  card.append(panel);
+  return card;
+}
+
+function renderAwsEnvRow(e) {
+  const row = el("div", "awsenv-row");
+  const inf = el("div", "awsenv-info");
+  const title = el("div", "awsenv-envname");
+  title.append(el("span", "awsenv-tenant", e.tenant));
+  title.append(el("span", "awsenv-backend", e.backend));
+  inf.append(title);
+  const sub = el("div", "awsenv-meta");
+  sub.append(el("span", "awsenv-sub", e.region));
+  if (e.profileMissing) sub.append(el("span", "awsenv-sub", "profile not pulled"));
+  inf.append(sub);
+  row.append(inf);
+  const open = el("button", "btn-ghost", "Open rcf");
+  open.title = "Open rcf for " + e.backend + " / " + e.tenant
+    + " (profile " + e.profile + ", region " + e.region + ")";
+  open.addEventListener("click", () => openAwsTerminal(e.name, open));
+  row.append(open);
+  return row;
+}
+
+async function openAwsProfileTerminal(profile, btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Opening…";
+  try {
+    const res = await api("/api/aws/profile-terminal", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile }),
+    });
+    if (res.ok) toast("Terminal opened: " + profile, "ok", "SSO-logs in if the session expired");
+    else toast("Could not open terminal", "err", res.error || "");
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+async function awsRefresh(btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Refreshing…";
+  try {
+    const res = await api("/api/aws/pull", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    if (res.ok) {
+      let envMsg = res.profiles + " profiles";
+      try {
+        const s = await api("/api/aws/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        if (s.ok) envMsg += "  ·  " + s.count + " envs from wiki";
+      } catch (e) { /* env sync optional */ }
+      toast("Refreshed " + res.accounts + " accounts", "ok", envMsg);
+      renderAwsView();
+    }
+    else if (res.needLogin) toast("Not signed in", "err", "AWS SSO login first, then Refresh");
+    else toast("Refresh failed", "err", res.error || "");
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
 }
 
 function warnRow(text) {
@@ -1351,6 +1482,97 @@ async function awsLogin(btn) {
   finally { btn.disabled = false; btn.textContent = label; }
 }
 
+async function awsPull(btn, statusEl) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Pulling…";
+  try {
+    const res = await api("/api/aws/pull", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (res.ok) {
+      toast("Created " + res.profiles + " profiles from " + res.accounts + " AWS accounts", "ok");
+      if (statusEl) fillAwsStatus(statusEl);
+    } else if (res.needLogin) {
+      toast("Not signed in", "err", "Press “AWS SSO login” first, finish it in the browser, then Pull again");
+    } else {
+      toast("Pull failed", "err", res.error || "");
+    }
+  } catch (e) { toast("Request failed", "err", String(e)); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+async function fillAwsStatus(statusEl) {
+  statusEl.innerHTML = "";
+  let d;
+  try { d = await api("/api/aws/accounts"); } catch (e) { statusEl.append(el("span", "jk-warn", "⚠ status unavailable")); return; }
+  if (!d || !d.ok) { statusEl.append(el("span", "jk-warn", "⚠ status unavailable")); return; }
+  statusEl.append(d.loggedIn
+    ? el("span", "jk-ok", "✓ signed in to AWS SSO")
+    : el("span", "jk-warn", "⚠ not signed in — press AWS SSO login"));
+  const n = (d.profiles || []).length;
+  if (n) statusEl.append(el("span", "set-dim", "  ·  " + n + " profiles created"
+    + (d.generatedAt ? " (" + d.generatedAt.replace("T", " ") + ")" : "")));
+}
+
+// AWS SSO login profile — defaulted non-private values live in Settings; the app
+// pulls the accounts from SSO and creates the profiles (no local-config lookup).
+function buildAwsSection(data) {
+  const s = (data.settings || {});
+  const sec = setSection("AWS",
+    "Sign in to AWS SSO and let the launcher pull your accounts and create the profiles. "
+    + "No profiles are read from your local AWS config.");
+
+  const status = el("div", "set-status");
+  sec.append(status);
+  fillAwsStatus(status);
+
+  const startUrl = el("input", "jk-input jk-urlinput"); startUrl.value = s.aws_sso_start_url || "";
+  const region = el("input", "jk-input"); region.value = s.aws_sso_region || "";
+  const session = el("input", "jk-input"); session.value = s.aws_sso_session || "";
+
+  const save = el("button", "btn-ghost", "Save");
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const r = await api("/api/settings", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          aws_sso_start_url: startUrl.value.trim(),
+          aws_sso_region: region.value.trim(),
+          aws_sso_session: session.value.trim(),
+        }),
+      });
+      if (r.ok) { toast("AWS login profile saved", "ok"); }
+      else toast("Save failed", "err", r.error || "");
+    } catch (e) { toast("Save failed", "err", String(e)); }
+    finally { save.disabled = false; }
+  });
+
+  const login = el("button", "btn-primary", "⎋ AWS SSO login");
+  login.title = "Open a terminal and run aws sso login (browser opens once)";
+  login.addEventListener("click", () => awsLogin(login));
+  const pull = el("button", "btn-ghost", "Pull accounts & create profiles");
+  pull.title = "List every account/role you can access from AWS SSO and write them as profiles";
+  pull.addEventListener("click", () => awsPull(pull, status));
+
+  const form = el("div", "set-form");
+  const hint = el("div", "jk-hint");
+  hint.textContent = "These are the non-private SSO values (defaulted). Login opens the browser once; "
+    + "Pull then lists your accounts from AWS and creates one profile per account/role.";
+  form.append(labelRow("SSO start URL", startUrl), labelRow("SSO region", region),
+    labelRow("Session name", session), hint,
+    btnRow([login, pull, save]));
+  sec.append(form);
+  return sec;
+}
+
+function btnRow(buttons) {
+  const row = el("div", "certcard-actions");
+  for (const b of buttons) row.append(b);
+  return row;
+}
+
 /* ---- Settings (credentials + dynamic sources) ---- */
 async function renderSettingsView() {
   const main = $("#main");
@@ -1378,6 +1600,7 @@ async function renderSettingsView() {
   body.append(buildThemeSection());
   body.append(buildDisplaySection());
   body.append(buildBrowserSection(data));
+  body.append(buildAwsSection(data));
   body.append(buildCertsSection(data));
   body.append(buildSourcesSection(data));
 }

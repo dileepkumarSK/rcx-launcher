@@ -8,6 +8,7 @@ Run:  python3 server.py [--port 8766]
 """
 
 import base64
+import datetime
 import glob
 import http.cookiejar
 import json
@@ -36,7 +37,12 @@ SETTINGS_PATH = os.path.join(HERE, "settings.json")
 GITHUB_PATH = os.path.join(HERE, "github.json")
 SYNC_SCRIPT = os.path.join(HERE, "sync_wiki.py")
 AWS_ENVS_PATH = os.path.join(HERE, "aws_envs.json")
-AWS_SYNC_SCRIPT = os.path.join(HERE, "sync_aws_envs.py")
+# Env list is built from REAL sources (GitHub wiki backend/tenant table + the
+# AWS-pulled profiles) so it works without anyone's bashrc aliases.
+AWS_SYNC_SCRIPT = os.path.join(HERE, "sync_wiki_envs.py")
+AWS_ACCOUNTS_PATH = os.path.join(HERE, "aws_accounts.json")
+AWS_CONFIG_PATH = os.path.expanduser("~/.aws/config")
+AWS_SSO_CACHE = os.path.expanduser("~/.aws/sso/cache")
 DEFAULT_PORT = 8766
 
 # Dynamic configuration (overridable via settings.json, no code edits needed).
@@ -48,6 +54,11 @@ DEFAULT_SETTINGS = {
     "kafka_certs_dir": "~/SOFT/kafka",   # local folder of downloaded Kafka cert bundles
     "mongo_certs_dir": "~/SOFT/mongo",   # local folder of downloaded Mongo cert bundles
     "certs_search_home": False,          # scan the whole home dir instead of the folders above
+    # AWS SSO login profile — non-private defaults; the app pulls accounts/roles from
+    # SSO and creates the AWS profiles itself (no dependence on a pre-existing config).
+    "aws_sso_start_url": "https://loyaltymethods.awsapps.com/start",
+    "aws_sso_region": "us-west-2",
+    "aws_sso_session": "login",
 }
 
 
@@ -64,7 +75,8 @@ def load_settings():
 def save_settings(data):
     cfg = load_settings()
     for k in ("github_org", "wiki_url", "jenkins_host_suffix",
-              "kafka_certs_dir", "mongo_certs_dir"):
+              "kafka_certs_dir", "mongo_certs_dir",
+              "aws_sso_start_url", "aws_sso_region", "aws_sso_session"):
         if data.get(k):
             cfg[k] = str(data[k]).strip()
     if data.get("browser") in ("chrome", "default"):
@@ -843,6 +855,190 @@ def build_sso_login_command(meta):
     return "aws sso login --sso-session %s" % shlex.quote(sess)
 
 
+# ---- AWS SSO: login config lives in the launcher; accounts/profiles are pulled
+#      from SSO and written by the app (never read from a pre-existing config). ----
+def aws_sso_cfg():
+    s = load_settings()
+    return {
+        "start_url": s.get("aws_sso_start_url") or DEFAULT_SETTINGS["aws_sso_start_url"],
+        "region": s.get("aws_sso_region") or DEFAULT_SETTINGS["aws_sso_region"],
+        "session": s.get("aws_sso_session") or DEFAULT_SETTINGS["aws_sso_session"],
+    }
+
+
+def _aws_access_token(start_url):
+    """The cached SSO access token for this start URL if present and unexpired,
+    else None. The token is a short-lived credential — used only to call AWS SSO
+    on localhost, never logged or returned to the UI."""
+    try:
+        files = glob.glob(os.path.join(AWS_SSO_CACHE, "*.json"))
+    except Exception:
+        return None
+    now = time.time()
+    for f in files:
+        try:
+            with open(f, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not d.get("accessToken"):
+            continue
+        su = d.get("startUrl") or ""
+        if su and su != start_url:
+            continue
+        exp = d.get("expiresAt", "")
+        try:
+            e = datetime.datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            e = 0
+        if e > now:
+            return d["accessToken"]
+    return None
+
+
+def aws_sso_status():
+    cfg = aws_sso_cfg()
+    tok = _aws_access_token(cfg["start_url"])
+    return {"loggedIn": bool(tok), "startUrl": cfg["start_url"],
+            "region": cfg["region"], "session": cfg["session"]}
+
+
+def _aws(args, token=None, timeout=60):
+    r = subprocess.run(["aws"] + args, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "aws failed").strip()[:300])
+    return json.loads(r.stdout) if r.stdout.strip() else {}
+
+
+def aws_pull_accounts():
+    """Enumerate every account+role the signed-in user can access, straight from
+    AWS SSO. Returns a list of {accountId, accountName, email, roles:[...]}.
+    Raises RuntimeError('login') if there is no valid SSO token yet."""
+    cfg = aws_sso_cfg()
+    tok = _aws_access_token(cfg["start_url"])
+    if not tok:
+        raise RuntimeError("login")
+    region = cfg["region"]
+    accounts = []
+    data = _aws(["sso", "list-accounts", "--access-token", tok,
+                 "--region", region, "--output", "json"], timeout=60)
+    for a in data.get("accountList", []):
+        aid = a.get("accountId")
+        roles = []
+        try:
+            rd = _aws(["sso", "list-account-roles", "--access-token", tok,
+                       "--account-id", aid, "--region", region, "--output", "json"],
+                      timeout=60)
+            roles = [r.get("roleName") for r in rd.get("roleList", []) if r.get("roleName")]
+        except Exception:
+            roles = []
+        accounts.append({"accountId": aid, "accountName": a.get("accountName", ""),
+                         "email": a.get("emailAddress", ""), "roles": roles})
+    accounts.sort(key=lambda x: x["accountName"].lower())
+    return accounts
+
+
+# Short client aliases so account names map to the names already in use.
+_CLIENT_ALIAS = {"speedway": "spwy"}
+
+
+def _profile_name(account_name, role, multi_role):
+    """A short, recognizable profile name from an SSO account, matching the existing
+    convention: a client's Development account → "<client>" (e.g. sei), its
+    Production account → "<client>-prod" (e.g. sei-prod). "AT&T" → att, "7GT" → 7gt."""
+    name = re.sub(r"(?i)^\s*rcx\s+", "", account_name or "").replace("&", "")  # AT&T -> ATT
+    toks = name.split()
+    tier = ""
+    if toks and toks[-1].lower() in ("development", "dev"):
+        toks = toks[:-1]
+    elif toks and toks[-1].lower() in ("production", "prod"):
+        toks = toks[:-1]
+        tier = "prod"
+    client = re.sub(r"[^a-z0-9]+", "-", " ".join(toks).lower()).strip("-")
+    client = _CLIENT_ALIAS.get(client, client) or "rcx"
+    pname = client + ("-" + tier if tier else "")
+    if multi_role and role:
+        pname += "-" + re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-")
+    return pname
+
+
+def ensure_sso_session_config():
+    """Make sure ~/.aws/config has the [sso-session NAME] block the app expects,
+    writing it from the launcher's settings if absent. Only adds; never edits an
+    existing block."""
+    cfg = aws_sso_cfg()
+    name = cfg["session"]
+    os.makedirs(os.path.dirname(AWS_CONFIG_PATH), exist_ok=True)
+    txt = ""
+    if os.path.exists(AWS_CONFIG_PATH):
+        with open(AWS_CONFIG_PATH, encoding="utf-8") as f:
+            txt = f.read()
+    if re.search(r"(?m)^\[sso-session\s+" + re.escape(name) + r"\]\s*$", txt):
+        return False
+    block = ("\n[sso-session %s]\n"
+             "sso_start_url = %s\n"
+             "sso_region = %s\n"
+             "sso_registration_scopes = sso:account:access\n"
+             % (name, cfg["start_url"], cfg["region"]))
+    with open(AWS_CONFIG_PATH, "a", encoding="utf-8") as f:
+        f.write(block)
+    return True
+
+
+def write_aws_profiles(accounts):
+    """Create an AWS profile per account/role in ~/.aws/config. APPEND-ONLY and
+    non-destructive: an existing profile (by name) is left exactly as-is; only
+    genuinely new profiles are appended. Never rewrites or deletes existing text.
+    Returns every profile with an `existed` flag."""
+    cfg = aws_sso_cfg()
+    ensure_sso_session_config()
+    txt = ""
+    if os.path.exists(AWS_CONFIG_PATH):
+        with open(AWS_CONFIG_PATH, encoding="utf-8") as f:
+            txt = f.read()
+    existing = set(re.findall(r"(?m)^\[profile\s+([^\]]+)\]\s*$", txt))
+    profiles, new_blocks = [], []
+    for a in accounts:
+        roles = a.get("roles") or []
+        multi = len(roles) > 1
+        for role in roles:
+            pname = _profile_name(a["accountName"], role, multi)
+            had = pname in existing
+            profiles.append({"profile": pname, "accountId": a["accountId"],
+                             "accountName": a["accountName"], "role": role,
+                             "region": cfg["region"], "existed": had})
+            if had:
+                continue                       # never touch an existing profile
+            existing.add(pname)                # avoid duplicates within this batch
+            new_blocks.append(
+                "[profile %s]\nsso_session = %s\nsso_account_id = %s\n"
+                "sso_role_name = %s\nregion = %s\n"
+                % (pname, cfg["session"], a["accountId"], role, cfg["region"]))
+    if new_blocks:
+        if txt and not txt.endswith("\n"):
+            txt += "\n"
+        txt += "\n" + "\n".join(new_blocks)
+        with open(AWS_CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write(txt)
+    return profiles
+
+
+def save_aws_accounts(accounts, profiles):
+    data = {"generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "accounts": accounts, "profiles": profiles}
+    with open(AWS_ACCOUNTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return data
+
+
+def load_aws_accounts():
+    try:
+        with open(AWS_ACCOUNTS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"accounts": [], "profiles": []}
+
+
 # ---------------------------------------------------------------------------
 # Kafka / Mongo cert bundles: scan a local folder of downloaded cert bundles and
 # turn each into copy-ready connection settings. Secrets (keystore passwords, DB
@@ -1313,6 +1509,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_certs_connect()
         elif path == "/api/aws/envs":
             self._handle_aws_envs()
+        elif path == "/api/aws/accounts":
+            self._handle_aws_accounts()
         else:
             self._serve_static(path)
 
@@ -1450,6 +1648,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_aws_login()
         elif path == "/api/aws/sync":
             self._handle_aws_sync()
+        elif path == "/api/aws/pull":
+            self._handle_aws_pull()
+        elif path == "/api/aws/profile-terminal":
+            self._handle_aws_profile_terminal()
         else:
             self.send_error(404, "Not found")
 
@@ -1470,12 +1672,72 @@ class Handler(BaseHTTPRequestHandler):
                          "error": None if ok else msg})
 
     def _handle_aws_login(self):
-        meta = load_aws_envs()
-        ok, msg = open_terminal(build_sso_login_command(meta))
+        # The app owns the login config: make sure the sso-session block exists in
+        # ~/.aws/config (written from Settings), then open a terminal to sign in.
+        try:
+            ensure_sso_session_config()
+        except Exception as exc:
+            self._send_json({"ok": False, "error": "could not set up ~/.aws/config: %s" % exc}, 500)
+            return
+        cfg = aws_sso_cfg()
+        ok, msg = open_terminal("aws sso login --sso-session %s" % shlex.quote(cfg["session"]))
         self._send_json({"ok": ok, "error": None if ok else msg})
 
+    def _handle_aws_accounts(self):
+        st = aws_sso_status()
+        saved = load_aws_accounts()
+        self._send_json({"ok": True, **st,
+                         "accounts": saved.get("accounts", []),
+                         "profiles": saved.get("profiles", []),
+                         "generatedAt": saved.get("generated_at", "")})
+
+    def _handle_aws_profile_terminal(self):
+        prof = (self._read_json().get("profile") or "").strip()
+        known = {p.get("profile") for p in load_aws_accounts().get("profiles", [])}
+        if prof not in known or not prof:
+            self._send_json({"ok": False, "error": "unknown profile"}, 400)
+            return
+        try:
+            ensure_sso_session_config()
+        except Exception:
+            pass
+        # "Open terminal" opens rcf for this profile: set AWS_PROFILE, SSO-login
+        # only if the cached token is expired, activate the rcf venv, run rcx.
+        meta = load_aws_envs()
+        rcf = meta.get("rcf_dir") or ""
+        if not rcf or not os.path.isdir(rcf):
+            self._send_json({"ok": False, "profile": prof,
+                             "error": "rcf project dir not found: %s — re-run sync_aws_envs.py"
+                             % (rcf or "(unset)")}, 404)
+            return
+        ok, msg = open_terminal(build_rcx_command({"profile": prof}, meta))
+        self._send_json({"ok": ok, "profile": prof, "error": None if ok else msg})
+
+    def _handle_aws_pull(self):
+        try:
+            accounts = aws_pull_accounts()
+        except RuntimeError as exc:
+            if str(exc) == "login":
+                self._send_json({"ok": False, "needLogin": True,
+                                 "error": "not signed in — press AWS SSO login first"}, 401)
+                return
+            self._send_json({"ok": False, "error": str(exc)}, 502)
+            return
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 502)
+            return
+        try:
+            profiles = write_aws_profiles(accounts)
+            save_aws_accounts(accounts, profiles)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": "pulled accounts but could not write profiles: %s" % exc}, 500)
+            return
+        created = sum(1 for p in profiles if not p.get("existed"))
+        self._send_json({"ok": True, "accounts": len(accounts),
+                         "profiles": len(profiles), "created": created})
+
     def _handle_aws_sync(self):
-        """Re-seed aws_envs.json from the shell recipes (reference only)."""
+        """Rebuild aws_envs.json from the wiki backend/tenant table + pulled profiles."""
         try:
             r = subprocess.run([sys.executable, AWS_SYNC_SCRIPT],
                                capture_output=True, text=True, timeout=30)

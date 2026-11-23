@@ -9,6 +9,8 @@ settings.json
 favorites.json
 .jenkins_jobs_cache.json
 aws_envs.json
+aws_accounts.json
+*.bak-*
 
 # --- Python / runtime cruft ---
 __pycache__/
