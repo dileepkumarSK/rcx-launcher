@@ -78,6 +78,23 @@ REGION_BY_BACKEND = {
 }
 DEFAULT_REGION = "us-west-2"
 
+# Production environments. The Common-Access-Sheet table is non-prod only; the
+# prod backends live on the wiki's All-Prod-URLs page (section ids: seiprod,
+# wuprod, mgmprod2, spwyprod, bpprod, 7gt-prod1, taprod, gapprod). Backend casing
+# and the two irregular tenants (MGM -> MGMProd2, 7GT -> tenant "HI") are taken
+# from those sections. Profile = <client>-prod, matched to the pulled AWS
+# "<Client> Production" accounts.  (client, backend, tenant, region)
+PROD_ENVS = [
+    ("sei",  "RCX-SEIProd",  "Prod", "us-west-2"),
+    ("wu",   "RCX-WUProd",   "Prod", "us-east-1"),
+    ("mgm",  "RCX-MGMProd2", "Prod", "us-west-2"),
+    ("spwy", "RCX-SPWYProd", "Prod", "us-west-2"),
+    ("bp",   "RCX-BPProd",   "Prod", "us-east-2"),
+    ("7gt",  "RCX-7GTProd1", "HI",   "us-west-2"),
+    ("ta",   "RCX-TAProd",   "Prod", "us-east-2"),
+    ("gap",  "RCX-GAPProd",  "Prod", "us-west-2"),
+]
+
 DEFAULT_META = {
     "rcf_dir": "",
     "venv_activate": "venv/bin/activate",
@@ -150,6 +167,21 @@ def build_envs(rows, profiles):
     return envs, unmatched
 
 
+def build_prod_envs(profiles):
+    """The production environments (profile <client>-prod), appended to the
+    non-prod envs parsed from the access sheet."""
+    out = []
+    for tok, backend, tenant, region in PROD_ENVS:
+        profile = tok + "-prod"
+        entry = {"name": profile, "client": profile,
+                 "profile": profile, "region": region,
+                 "backend": backend, "tenant": tenant}
+        if profiles and profile not in profiles:
+            entry["profileMissing"] = True
+        out.append(entry)
+    return out
+
+
 def main():
     if not os.path.exists(ACCESS_SHEET):
         sys.stderr.write(
@@ -159,6 +191,7 @@ def main():
     rows = parse_access_sheet(ACCESS_SHEET)
     profiles = known_profiles()
     envs, unmatched = build_envs(rows, profiles)
+    envs += build_prod_envs(profiles)
     meta = load_meta()
 
     # group client-wise (stable: first-seen client order), tenants within a client

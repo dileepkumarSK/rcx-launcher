@@ -942,10 +942,24 @@ def aws_pull_accounts():
 _CLIENT_ALIAS = {"speedway": "spwy"}
 
 
-def _profile_name(account_name, role, multi_role):
-    """A short, recognizable profile name from an SSO account, matching the existing
-    convention: a client's Development account → "<client>" (e.g. sei), its
-    Production account → "<client>-prod" (e.g. sei-prod). "AT&T" → att, "7GT" → 7gt."""
+# When an SSO account grants several roles, create ONE profile named by
+# client+env and use the preferred role for it (the launcher's rcx access).
+_PREFERRED_ROLES = ("JavaL1Access",)
+
+
+def _pick_role(roles):
+    for pref in _PREFERRED_ROLES:
+        for r in roles:
+            if (r or "").lower() == pref.lower():
+                return r
+    return roles[0] if roles else ""
+
+
+def _profile_name(account_name):
+    """A short, recognizable profile name from an SSO account, named by client +
+    env only (NOT by role): a client's Development account → "<client>" (e.g. sei),
+    its Production account → "<client>-prod" (e.g. sei-prod). "AT&T" → att,
+    "7GT" → 7gt. One profile per account."""
     name = re.sub(r"(?i)^\s*rcx\s+", "", account_name or "").replace("&", "")  # AT&T -> ATT
     toks = name.split()
     tier = ""
@@ -956,10 +970,7 @@ def _profile_name(account_name, role, multi_role):
         tier = "prod"
     client = re.sub(r"[^a-z0-9]+", "-", " ".join(toks).lower()).strip("-")
     client = _CLIENT_ALIAS.get(client, client) or "rcx"
-    pname = client + ("-" + tier if tier else "")
-    if multi_role and role:
-        pname += "-" + re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-")
-    return pname
+    return client + ("-" + tier if tier else "")
 
 
 def ensure_sso_session_config():
@@ -997,23 +1008,25 @@ def write_aws_profiles(accounts):
         with open(AWS_CONFIG_PATH, encoding="utf-8") as f:
             txt = f.read()
     existing = set(re.findall(r"(?m)^\[profile\s+([^\]]+)\]\s*$", txt))
-    profiles, new_blocks = [], []
+    profiles, new_blocks, taken = [], [], set()
     for a in accounts:
         roles = a.get("roles") or []
-        multi = len(roles) > 1
-        for role in roles:
-            pname = _profile_name(a["accountName"], role, multi)
-            had = pname in existing
-            profiles.append({"profile": pname, "accountId": a["accountId"],
-                             "accountName": a["accountName"], "role": role,
-                             "region": cfg["region"], "existed": had})
-            if had:
-                continue                       # never touch an existing profile
-            existing.add(pname)                # avoid duplicates within this batch
-            new_blocks.append(
-                "[profile %s]\nsso_session = %s\nsso_account_id = %s\n"
-                "sso_role_name = %s\nregion = %s\n"
-                % (pname, cfg["session"], a["accountId"], role, cfg["region"]))
+        role = _pick_role(roles)
+        pname = _profile_name(a["accountName"])
+        if pname in taken:                     # two accounts → same client+env name
+            continue
+        taken.add(pname)
+        had = pname in existing
+        profiles.append({"profile": pname, "accountId": a["accountId"],
+                         "accountName": a["accountName"], "role": role,
+                         "roles": roles, "region": cfg["region"], "existed": had})
+        if had:
+            continue                           # never touch an existing profile
+        existing.add(pname)
+        new_blocks.append(
+            "[profile %s]\nsso_session = %s\nsso_account_id = %s\n"
+            "sso_role_name = %s\nregion = %s\n"
+            % (pname, cfg["session"], a["accountId"], role, cfg["region"]))
     if new_blocks:
         if txt and not txt.endswith("\n"):
             txt += "\n"
