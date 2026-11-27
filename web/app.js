@@ -1306,9 +1306,38 @@ async function renderAwsView() {
   if (envMeta.generatedAt) info.append(document.createTextNode("  ·  envs " + envMeta.generatedAt.replace("T", " ")));
   if (!envMeta.hasRcf) body.append(warnRow("rcf project dir not set — Open rcf needs it; configure in Settings or run sync."));
 
-  const grid = el("div", "aws-grid");
-  for (const p of profiles) grid.append(renderAwsAccount(p, data.session, envsByProfile[p.profile] || []));
-  body.append(grid);
+  // Group accounts by client (profile without the -prod suffix). A group is a
+  // real client when it has environments or a dev/prod pair; lone infra accounts
+  // (monitoring, lm-aws-test, …) fall under "Others".
+  const CLIENT_ALIAS = { marriot: "marriott" };   // AWS account spelled "Marriot"
+  const baseOf = (prof) => { const b = prof.replace(/-prod$/, ""); return CLIENT_ALIAS[b] || b; };
+  const byClient = new Map();
+  for (const p of profiles) {
+    const b = baseOf(p.profile);
+    (byClient.get(b) || byClient.set(b, []).get(b)).push(p);
+  }
+  const clientGroups = [], others = [];
+  for (const [b, accts] of byClient) {
+    const hasEnv = accts.some(a => (envsByProfile[a.profile] || []).length);
+    if (hasEnv || accts.length > 1) clientGroups.push([b, accts]);
+    else others.push(...accts);
+  }
+  clientGroups.sort((a, b) => a[0].localeCompare(b[0]));
+  for (const [, accts] of clientGroups)         // dev before -prod within a client
+    accts.sort((x, y) => x.profile.length - y.profile.length || x.profile.localeCompare(y.profile));
+  others.sort((x, y) => x.profile.localeCompare(y.profile));
+
+  const section = (title, accts) => {
+    const grp = el("div", "aws-group");
+    grp.dataset.text = title.toLowerCase() + " " + accts.map(a => a.profile).join(" ");
+    grp.append(el("div", "aws-client", title));
+    const grid = el("div", "aws-grid");
+    for (const p of accts) grid.append(renderAwsAccount(p, data.session, envsByProfile[p.profile] || []));
+    grp.append(grid);
+    body.append(grp);
+  };
+  for (const [b, accts] of clientGroups) section(b.toUpperCase(), accts);
+  if (others.length) section("Others", others);
 
   if (unmatchedEnvs.length) {
     const note = el("div", "aws-warn");
@@ -2069,6 +2098,15 @@ function applyFilter(q) {
     });
     document.querySelectorAll(".repo-bucket").forEach(sec => {
       const anyVisible = [...sec.querySelectorAll(".repoitem")]
+        .some(c => !c.classList.contains("hidden"));
+      sec.classList.toggle("hidden", !anyVisible);
+    });
+  } else if (selected === AWS_KEY) {
+    document.querySelectorAll(".awsacct").forEach(card => {
+      card.classList.toggle("hidden", !!q && !card.dataset.text.includes(q));
+    });
+    document.querySelectorAll(".aws-group").forEach(sec => {
+      const anyVisible = [...sec.querySelectorAll(".awsacct")]
         .some(c => !c.classList.contains("hidden"));
       sec.classList.toggle("hidden", !anyVisible);
     });
